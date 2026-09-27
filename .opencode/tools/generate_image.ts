@@ -86,7 +86,8 @@ function approvalPath() {
 }
 
 // A paid call needs a one-time approval written by the desktop app after the
-// user accepts the confirmation dialog. The approval is consumed on use.
+// user accepts the confirmation dialog. The approval is consumed on use, and it
+// only authorises the exact request it was granted for.
 async function consumeApproval(request: Record<string, unknown>) {
     let approval: any = null
     try {
@@ -95,11 +96,9 @@ async function consumeApproval(request: Record<string, unknown>) {
         return false
     }
     if (!approval || typeof approval !== "object") return false
-    const matches =
-        String(approval.prompt || "") === String(request.prompt) &&
-        String(approval.backend || "") === String(request.backend) &&
-        String(approval.aspect_ratio || "") === String(request.aspect_ratio) &&
-        String(approval.resolution || "") === String(request.resolution)
+    const matches = Object.keys(request).every(
+        (key) => String(approval[key] ?? "") === String(request[key] ?? "")
+    )
     if (!matches) return false
     await unlink(approvalPath()).catch(() => {})
     return true

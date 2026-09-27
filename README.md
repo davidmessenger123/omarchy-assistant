@@ -88,6 +88,27 @@ Keys cover the chat model and the optional escalate model, the image backend, bo
 
 It verifies required commands, `/dev/uinput` access, venv support, the settings file, the Hyprland config and keybinding, the git checkout and whether it is behind `origin`, the OpenCode install and model list, the Gemini key (without printing it), the local image backend including GPU runtime and cached weights, free disk space, and that screen capture actually works. It changes nothing and exits non-zero if any check fails.
 
+## Editing images
+
+The `edit_image` tool changes an image that already exists, using the same two backends:
+
+- **gemini** sends the image as a reference, which follows instructions closely, for example replacing an object or a background. It is billed per call and, with `confirm_images` on, needs your approval first.
+- **local** runs SDXL-Turbo img2img on your GPU. It is free, private, and keeps the original composition, so it suits small changes like "make it darker", "add rain", or "make it winter". `strength` (0.1 to 0.9) controls how much is redrawn, and `steps` (1 to 4) the sampling.
+
+Ask in plain language, for example "make ~/Pictures/shot.png look like winter". The source image must be a PNG, JPEG, or WebP file under `/home`, and at most 32 MB. The edited result is saved under `~/Pictures/omarchy-assistant/`, shown inline, and becomes the image you can iterate on next.
+
+## Choosing a model
+
+The header shows the model in use; clicking it opens a panel listing every model `opencode` can reach, with the current one marked. Choosing one stores it in `model`, so it persists across restarts and machines.
+
+Set `model_escalate` to a stronger model and the panel gains an **Escalate** button that re-asks your last question with that model, keeping the conversation:
+
+```bash
+./assistant_config.py set model_escalate opencode/nemotron-3-ultra-free
+```
+
+Escalations are recorded in the action history. Only models your OpenCode install can actually authenticate will work, so check `opencode models` for the list.
+
 ## Seeing the screen and images
 
 **The assistant can ask to look at your screen.** When it needs something it cannot infer, such as an error message or what a dialog says, it calls `look_at` and stops. The app captures the screen and sends it back with the next turn, so the answer is based on what is actually on screen. Because OpenCode runs one turn at a time, the screenshot always arrives in a follow-up message rather than mid-answer. The number of screenshots per request is capped by `max_looks` (default 3), and the status line shows when the app is looking.

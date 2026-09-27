@@ -73,6 +73,11 @@ ShellRoot {
     property bool lastImagePending: false
     property string pendingSendPrompt: ""
     property var pendingLook: null
+    property var modelList: []
+    property bool modelPanelVisible: false
+    property string modelListBuffer: ""
+    property string turnModel: ""
+    property string lastUserPrompt: ""
     property int looksUsed: 0
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
@@ -249,6 +254,66 @@ ShellRoot {
         if (isFinite(looks) && looks > 0) root.maxLooks = looks
         if (parsed.screen_monitor) root.screenMonitor = String(parsed.screen_monitor)
         root.settingsLoaded = true
+    }
+
+    function readModelList() {
+        if (modelListRead.running) return
+        modelListRead.command = [root.opencodeBin, "models"]
+        modelListRead.running = true
+    }
+
+    function finishModelList() {
+        var lines = root.modelListBuffer.split(/\r?\n/)
+        root.modelListBuffer = ""
+        var models = []
+        for (var i = 0; i < lines.length; i++) {
+            var value = String(lines[i] || "").trim()
+            if (value && value.indexOf("/") !== -1) models.push(value)
+        }
+        if (models.length > 0) {
+            root.modelList = models.slice(0, 40)
+            // Keep the configured model selectable even if the listing is stale.
+            if (root.modelList.indexOf(root.model) === -1) {
+                root.modelList = [root.model].concat(root.modelList).slice(0, 40)
+            }
+        }
+    }
+
+    function toggleModelPanel() {
+        root.modelPanelVisible = !root.modelPanelVisible
+        if (root.modelPanelVisible) root.readModelList()
+    }
+
+    function chooseModel(id) {
+        if (!id) return
+        root.model = String(id)
+        root.modelPanelVisible = false
+        root.statusText = "Model: " + root.model
+        root.saveSetting("model", root.model)
+    }
+
+    function escalateLast() {
+        if (root.busy || root.clickBusy) return
+        if (!root.modelEscalate) {
+            root.statusText = "Set model_escalate in settings to a stronger model first"
+            return
+        }
+        if (!root.lastUserPrompt) {
+            root.statusText = "Ask something first, then escalate"
+            return
+        }
+        root.turnModel = root.modelEscalate
+        root.pendingSendPrompt = root.lastUserPrompt
+        root.modelPanelVisible = false
+        root.statusText = "Asking again with " + root.modelEscalate
+        root.logAction("settings", "Escalated the last answer to " + root.modelEscalate, String(root.lastUserPrompt).slice(0, 80))
+        root.finishSend()
+    }
+
+    function shortModel() {
+        var value = String(root.turnModel || root.model || "")
+        var slash = value.lastIndexOf("/")
+        return slash >= 0 ? value.slice(slash + 1) : value
     }
 
     function readSettings() {
@@ -552,7 +617,7 @@ ShellRoot {
     }
 
     function buildModelCommand(prompt, files) {
-        var args = [root.opencodeBin, "run", "--model", root.model, "--format", "json", "--pure", "--dir", root.appDir, "--agent", "chatbot", "--title", "Omarchy Assistant"]
+        var args = [root.opencodeBin, "run", "--model", root.turnModel || root.model, "--format", "json", "--pure", "--dir", root.appDir, "--agent", "chatbot", "--title", "Omarchy Assistant"]
         if (root.sessionId) args.push("--session", root.sessionId)
         for (var i = 0; i < files.length; i++) args.push("--file", files[i])
         args.push("--", prompt)
@@ -581,6 +646,7 @@ ShellRoot {
         // that references them exists.
         root.attachedImage = ""
         root.lastImagePending = false
+        root.turnModel = ""
         opencode.running = true
         Qt.callLater(function() { input.forceActiveFocus() })
     }
@@ -907,6 +973,27 @@ ShellRoot {
                         root.logAction("image", "Generated an image with " + String(proposal.backend || "the image backend") + (proposal.approved ? " after approval" : ""), String(proposal.width || "") + "x" + String(proposal.height || "") + (proposal.resolution ? " " + proposal.resolution : "") + seconds)
                     }
                 }
+            } else if (tool === "edit_image") {
+                root.statusText = "Editing the image"
+                if (event.part.state) {
+                    var edit = null
+                    try {
+                        edit = JSON.parse(String(event.part.state.output || "").trim())
+                    } catch (error) {
+                        edit = null
+                    }
+                    if (edit && edit.needs_confirmation === true && edit.request) {
+                        root.pendingImage = { request: edit.request }
+                        root.statusText = "Waiting for image approval"
+                    } else if (edit && edit.ok === true) {
+                        if (edit.path) {
+                            root.lastImage = String(edit.path)
+                            root.lastImagePending = true
+                        }
+                        var seconds = edit.generate_seconds ? " in " + edit.generate_seconds + "s" : ""
+                        root.logAction("image", "Edited an image with " + String(edit.backend || "the image backend") + (edit.approved ? " after approval" : ""), String(edit.width || "") + "x" + String(edit.height || "") + (edit.strength ? " strength " + edit.strength : "") + seconds)
+                    }
+                }
             } else if (tool === "look_at") {
                 root.statusText = "Looking at the screen"
                 if (event.part.state) {
@@ -1082,6 +1169,7 @@ ShellRoot {
         root.proposedAction = null
         root.errorText = ""
         root.currentUserPrompt = prompt
+        root.lastUserPrompt = prompt
         if (root.lastImagePending) {
             root.lastImagePending = false
             contextNote = "The image you generated in the previous message is attached, so you can see it and iterate on it."
@@ -1164,6 +1252,7 @@ ShellRoot {
         if (updateCheck.running) updateCheck.signal(15)
         if (updateApply.running) updateApply.signal(15)
         if (attachResolve.running) attachResolve.signal(15)
+        if (modelListRead.running) modelListRead.signal(15)
         if (attachClipboard.running) attachClipboard.signal(15)
         updateRestartDelay.stop()
         if (opencode.running) opencode.signal(15)
@@ -1250,6 +1339,16 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: modelListRead
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.modelListBuffer += line + "\n" }
+        }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) { root.finishModelList() }
     }
 
     Process {
@@ -1699,6 +1798,29 @@ ShellRoot {
                     }
 
                     Button {
+                        id: modelButton
+                        text: root.shortModel()
+                        onClicked: {
+                            root.toggleModelPanel()
+                            input.forceActiveFocus()
+                        }
+                        enabled: !root.busy && !root.clickBusy
+                        contentItem: Text {
+                            text: modelButton.text
+                            color: modelButton.enabled ? (root.modelPanelVisible ? "#9FE0C0" : "#DCE5F2") : "#657083"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 10
+                            color: root.modelPanelVisible ? "#1D3A38" : "#273247"
+                            border.color: root.modelPanelVisible ? "#477D6C" : "#3A465B"
+                        }
+                    }
+
+                    Button {
                         id: closeButton
                         text: "Close"
                         onClicked: root.closeAssistant()
@@ -1924,6 +2046,127 @@ ShellRoot {
                                                 onClicked: root.openFile(fileDelegate.modelData)
                                             }
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    id: modelPanel
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: root.modelPanelVisible ? 210 : 0
+                    visible: root.modelPanelVisible
+                    radius: 14
+                    color: "#18202C"
+                    border.width: 1
+                    border.color: "#3B4A5E"
+                    clip: true
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        spacing: 6
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "Model for every turn"
+                                color: "#9FE0C0"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                            }
+
+                            Text {
+                                text: root.modelEscalate
+                                    ? "Escalate uses " + root.modelEscalate
+                                    : "Set model_escalate to enable Escalate"
+                                color: "#7C8AA0"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 10
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 260
+                            }
+
+                            Button {
+                                id: escalateButton
+                                text: "Escalate"
+                                enabled: !root.busy && !root.clickBusy && root.modelEscalate !== "" && root.lastUserPrompt !== ""
+                                onClicked: root.escalateLast()
+                                contentItem: Text {
+                                    text: escalateButton.text
+                                    color: escalateButton.enabled ? "#0D1420" : "#718096"
+                                    font.family: "Sans Serif"
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 8
+                                    color: escalateButton.enabled ? "#9FE0C0" : "#293346"
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            radius: 10
+                            color: "#10151E"
+                            border.width: 1
+                            border.color: "#293346"
+                            clip: true
+
+                            ListView {
+                                id: modelListView
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                clip: true
+                                spacing: 3
+                                model: root.modelList
+
+                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                                delegate: Rectangle {
+                                    id: modelRow
+                                    required property string modelData
+                                    width: modelListView.width
+                                    height: 26
+                                    radius: 7
+                                    color: modelRow.modelData === root.model ? "#1D3A38" : "transparent"
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 8
+                                        anchors.rightMargin: 8
+                                        spacing: 8
+
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelRow.modelData
+                                            color: modelRow.modelData === root.model ? "#9FE0C0" : "#DCE5F2"
+                                            font.family: "Sans Serif"
+                                            font.pixelSize: 11
+                                            elide: Text.ElideRight
+                                        }
+
+                                        Text {
+                                            text: modelRow.modelData === root.model ? "current" : "use"
+                                            color: "#7C8AA0"
+                                            font.family: "Sans Serif"
+                                            font.pixelSize: 9
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.chooseModel(modelRow.modelData)
                                     }
                                 }
                             }
@@ -2499,7 +2742,7 @@ ShellRoot {
 
                 Text {
                     Layout.fillWidth: true
-                    text: root.statusText + (root.autoMode ? "  •  Auto" : "  •  Manual actions") + (root.autonomyActive ? "  •  Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps : "") + (root.screenAttached || root.forceScreen ? "  •  Screen context" : "") + (root.pendingClick !== null ? "  •  Confirmation" : "") + (root.pendingImage !== null ? "  •  Image approval" : "") + (root.memoryCount > 0 ? "  •  Memory " + root.memoryCount : "") + (root.activeSources.length > 0 ? "  •  " + root.activeSources.length + " source" + (root.activeSources.length === 1 ? "" : "s") : "") + (root.activeFiles.length > 0 ? "  •  " + root.activeFiles.length + " file" + (root.activeFiles.length === 1 ? "" : "s") : "") + "  •  Enter to send  •  Ctrl+. stop task  •  Ctrl+L new chat  •  Esc close"
+                    text: root.statusText + (root.autoMode ? "  •  Auto" : "  •  Manual actions") + "  •  Model: " + root.shortModel() + (root.modelPanelVisible ? " ▾" : "") + (root.autonomyActive ? "  •  Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps : "") + (root.screenAttached || root.forceScreen ? "  •  Screen context" : "") + (root.pendingClick !== null ? "  •  Confirmation" : "") + (root.pendingImage !== null ? "  •  Image approval" : "") + (root.memoryCount > 0 ? "  •  Memory " + root.memoryCount : "") + (root.activeSources.length > 0 ? "  •  " + root.activeSources.length + " source" + (root.activeSources.length === 1 ? "" : "s") : "") + (root.activeFiles.length > 0 ? "  •  " + root.activeFiles.length + " file" + (root.activeFiles.length === 1 ? "" : "s") : "") + "  •  Enter to send  •  Ctrl+. stop task  •  Ctrl+L new chat  •  Esc close"
                     color: "#7F8B9D"
                     font.family: "Sans Serif"
                     font.pixelSize: 11
@@ -2513,6 +2756,7 @@ ShellRoot {
         addMessage("assistant", "Ask me anything. I can search the web, read-only files under /home, use the screen when relevant, open installed apps, and continue guarded computer tasks when Auto is enabled. I remember local preferences and conversation context.")
         root.cleanupScreen()
         root.readSettings()
+        root.readModelList()
         root.refreshMemory()
         Qt.callLater(function() { input.forceActiveFocus() })
     }

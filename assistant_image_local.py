@@ -363,10 +363,135 @@ def prefetch(model: str) -> None:
     )
 
 
+def load_edit_pipeline(model: str):
+    """img2img reuses the text-to-image pipeline's weights instead of reloading."""
+    import torch  # noqa: PLC0415
+    from diffusers import AutoPipelineForImage2Image  # noqa: PLC0415
+
+    pipeline, device = load_pipeline(model)
+    return AutoPipelineForImage2Image.from_pipe(pipeline), device
+
+
+def edit(request: dict) -> None:
+    """Redraw an existing image from a text instruction, using local img2img."""
+    try:
+        prompt, _aspect, steps, seed, model = validate(request)
+    except ValueError as error:
+        fail(str(error))
+        return
+
+    source = str(request.get("path") or "")
+    if not source.startswith("/") or ".." in source:
+        fail("Give the path of an image under your home directory.")
+        return
+    path = Path(source)
+    if not str(path).startswith("/home/"):
+        fail("Only images under your home directory can be edited.")
+        return
+    if not path.is_file():
+        fail("That image does not exist.")
+        return
+    if path.stat().st_size > 32 * 1024 * 1024:
+        fail("That image is larger than 32 MB.")
+        return
+
+    try:
+        strength = float(request.get("strength", 0.6))
+    except (TypeError, ValueError):
+        strength = 0.6
+    strength = min(max(strength, 0.1), 0.9)
+
+    try:
+        import torch  # noqa: PLC0415
+        from PIL import Image  # noqa: PLC0415
+    except Exception as error:
+        fail(f"The local image backend is not installed ({error}).")
+        return
+
+    if not torch.cuda.is_available():
+        fail("The local image backend needs a GPU-enabled PyTorch build.")
+        return
+
+    try:
+        with Image.open(path) as handle:
+            image = handle.convert("RGB")
+            width, height = image.size
+    except Exception as error:
+        fail(f"That file could not be read as an image: {error}")
+        return
+
+    # Keep the input's shape, but bound it so a large photo cannot exhaust VRAM.
+    longest = max(width, height)
+    if longest > 1024:
+        scale = 1024 / longest
+        width = max(64, int(width * scale) // 8 * 8)
+        height = max(64, int(height * scale) // 8 * 8)
+        image = image.resize((width, height), Image.LANCZOS)
+
+    started = time.monotonic()
+    try:
+        with gpu_lock():
+            editor, device = load_edit_pipeline(model)
+            load_seconds = round(time.monotonic() - started, 2)
+            editor.set_progress_bar_config(disable=True)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            generate_started = time.monotonic()
+            try:
+                with torch.inference_mode():
+                    result = editor(
+                        prompt=prompt,
+                        image=image,
+                        strength=strength,
+                        num_inference_steps=steps,
+                        guidance_scale=0.0,
+                        generator=generator,
+                    ).images[0]
+            except torch.cuda.OutOfMemoryError:
+                fail("The local image model ran out of VRAM on that image.")
+                return
+            except Exception as error:
+                fail(f"Local image editing failed: {error}")
+                return
+            generate_seconds = round(time.monotonic() - generate_started, 2)
+    except TimeoutError:
+        fail("Another local image generation is still running. Try again in a moment.")
+        return
+    except Exception as error:
+        fail(f"Local image editing failed: {error}")
+        return
+
+    handle, temporary = tempfile.mkstemp(prefix="omarchy-assistant-image-", suffix=".png")
+    os.close(handle)
+    try:
+        result.save(temporary, format="PNG")
+    except Exception as error:
+        Path(temporary).unlink(missing_ok=True)
+        fail(f"Could not write the edited image: {error}")
+        return
+
+    emit(
+        {
+            "ok": True,
+            "backend": "local",
+            "path": temporary,
+            "mime": "image/png",
+            "width": result.width,
+            "height": result.height,
+            "steps": steps,
+            "strength": strength,
+            "seed": seed,
+            "model": model,
+            "device": device,
+            "load_seconds": load_seconds,
+            "generate_seconds": generate_seconds,
+        }
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("generate", "doctor", "selftest", "prefetch"), nargs="?", default="generate"
+        "command", choices=("generate", "edit", "doctor", "selftest", "prefetch"), nargs="?", default="generate"
     )
     parser.add_argument("--model", default=None, help="Hugging Face model id to use for the local backend")
     arguments = parser.parse_args()
@@ -379,6 +504,18 @@ def main() -> int:
         return 0
     if arguments.command == "prefetch":
         prefetch(arguments.model or os.environ.get("ASSISTANT_IMAGE_LOCAL_MODEL") or DEFAULT_MODEL)
+        return 0
+    if arguments.command == "edit":
+        raw = sys.stdin.read()
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as error:
+            fail(f"request was not valid JSON: {error}")
+            return 1
+        if not isinstance(payload, dict):
+            fail("request must be a JSON object")
+            return 1
+        edit(payload)
         return 0
 
     raw = sys.stdin.read()
