@@ -114,6 +114,31 @@ leaves the machine. `./assistant_clipboard_history.py status` says whether it is
 recording, and `clear` forgets everything. Pasting an entry goes through the same
 approval as any typing, and the history is never written to the action log.
 
+## Catching up on notifications
+
+Omarchy's shell is the notification daemon on this machine, and it exposes **no
+do-not-disturb control**, so the assistant cannot silence anything. What it can do
+is remember what arrived, so "what did I miss while I was in that call?" gets an
+answer. Recording is off by default, because notification bodies carry message
+previews:
+
+```bash
+./assistant_config.py set notifications true
+```
+
+Then ask "what did I miss", "catch me up", or "anything from the last hour". The
+assistant summarises what it finds grouped by app rather than dumping bodies, and
+it can mark notifications as read, clear the notification centre when you ask, and
+note a quiet stretch so catch-up covers exactly that window:
+
+- "start a 45 minute focus stretch" and "end the focus stretch"
+- `./assistant_notifications.py status` says whether it is recording and how much is stored
+
+One honesty note about fidelity: the listener reads notifications from the session
+bus, and one of the bus tools it uses prints text with backslash escapes already
+interpreted, so a body containing something like `C:\Users` can arrive with the
+backslash missing. Summaries and normal text are unaffected.
+
 ## Window and workspace control
 
 The assistant can read your window list and arrange what is open, which is usually

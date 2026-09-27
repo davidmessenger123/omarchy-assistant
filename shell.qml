@@ -26,6 +26,10 @@ ShellRoot {
     property var pendingClick: null
     property var proposedAction: null
     property var windowProposal: null
+    // The only commands the model can ask for. A name that is not in here is
+    // refused, so no command text ever reaches the shell from a tool.
+    readonly property var notificationCommands: ({ "dismiss_notifications": ["dismiss"] })
+    property string notificationRunBuffer: ""
     property string windowPlanBuffer: ""
     property string windowRunBuffer: ""
     property var activeClick: null
@@ -61,6 +65,7 @@ ShellRoot {
     property bool clipboardEnabled: false
     property bool remindersEnabled: true
     property bool clipboardHistory: false
+    property bool notificationHistory: false
     property int maxLooks: 3
     property string screenMonitor: "auto"
     property string settingsBuffer: ""
@@ -254,6 +259,8 @@ ShellRoot {
         root.clipboardEnabled = parsed.clipboard_enabled === true
         if (parsed.clipboard_history === true && !root.clipboardHistory) root.setClipboardHistory(true)
         if (parsed.clipboard_history !== true && root.clipboardHistory) root.setClipboardHistory(false)
+        if (parsed.notifications === true && !root.notificationHistory) root.setNotificationHistory(true)
+        if (parsed.notifications !== true && root.notificationHistory) root.setNotificationHistory(false)
         root.remindersEnabled = parsed.reminders_enabled !== false
         var steps = parseInt(parsed.max_autonomy_steps, 10)
         if (isFinite(steps) && steps > 0) root.maxAutonomySteps = steps
@@ -730,6 +737,7 @@ ShellRoot {
         if (action.kind === "type") return "type into " + action.target
         if (action.kind === "open_application") return "launch " + action.target
         if (action.kind === "window") return String(action.summary || "change the windows").toLowerCase()
+        if (action.kind === "command") return String(action.summary || "run that command").toLowerCase()
         return "click " + action.target
     }
 
@@ -738,6 +746,7 @@ ShellRoot {
         if (action.kind === "click") return "click|" + String(action.target || "").toLowerCase() + "|" + String(action.x) + "," + String(action.y)
         if (action.kind === "type") return "type|" + String(action.target || "").toLowerCase() + "|" + String(action.text || "")
         if (action.kind === "window") return "window|" + String(action.op || "") + "|" + String(action.target || "").toLowerCase()
+        if (action.kind === "command") return "command|" + String(action.command || "")
         return "open|" + String(action.application || action.target || "").toLowerCase()
     }
 
@@ -792,6 +801,18 @@ ShellRoot {
         } else if (proposal.action === "window") {
             root.planWindow(proposal)
             return
+        } else if (proposal.action === "command") {
+            var commandName = String(proposal.command || "")
+            if (!root.notificationCommands[commandName]) return
+            action = {
+                kind: "command",
+                command: commandName,
+                target: String(proposal.summary || "that command").slice(0, 200),
+                summary: String(proposal.summary || "run that command"),
+                detail: String(proposal.detail || ""),
+                requiresApproval: true,
+                risk: ""
+            }
         }
         if (!action) return
         if (root.proposedAction !== null) {
@@ -899,6 +920,48 @@ ShellRoot {
         Qt.callLater(function() { input.forceActiveFocus() })
     }
 
+    function setNotificationHistory(enabled) {
+        if (enabled === root.notificationHistory) return
+        root.notificationHistory = enabled
+        notificationHistory.command = ["/usr/bin/python3", root.appDir + "/assistant_notifications.py", enabled ? "start" : "stop"]
+        notificationHistory.running = true
+    }
+
+    function runNotificationCommand(name) {
+        var args = root.notificationCommands[String(name || "")]
+        if (!args) {
+            root.clickBusy = false
+            addMessage("assistant", "That command is not one I can run.")
+            return
+        }
+        notificationRun.command = ["/usr/bin/python3", root.appDir + "/assistant_notifications.py"].concat(args)
+        notificationRun.running = true
+    }
+
+    function finishNotificationCommand(exitCode) {
+        if (notificationRun.running) return
+        var result = null
+        try {
+            result = JSON.parse(root.notificationRunBuffer.trim())
+        } catch (error) {
+            result = null
+        }
+        root.notificationRunBuffer = ""
+        root.activeClick = null
+        root.clickBusy = false
+        if (exitCode !== 0 || !result || result.ok !== true) {
+            var message = result && result.error ? String(result.error) : "it did not work"
+            addMessage("assistant", "That did not work: " + message + ".")
+            root.statusText = "Nothing changed"
+        } else {
+            root.logAction("screen", "Cleared the notification centre", "notifications on screen were discarded")
+            root.statusText = "Notifications cleared"
+            addMessage("assistant", "Done: the notification centre is clear.")
+        }
+        assistant.visible = true
+        Qt.callLater(function() { input.forceActiveFocus() })
+    }
+
     function setClipboardHistory(enabled) {
         if (enabled === root.clipboardHistory) return
         root.clipboardHistory = enabled
@@ -922,6 +985,9 @@ ShellRoot {
         if (screenOpen.running) screenOpen.signal(15)
         if (windowPlan.running) windowPlan.signal(15)
         if (windowRun.running) windowRun.signal(15)
+        if (clipboardHistory.running) clipboardHistory.signal(15)
+        if (notificationHistory.running) notificationHistory.signal(15)
+        if (notificationRun.running) notificationRun.signal(15)
         root.activeClick = null
         root.clickBusy = false
         root.autonomyActive = false
@@ -951,6 +1017,8 @@ ShellRoot {
             root.logAction("app", "Launched " + (action.application || "an application"), action.target || "")
         } else if (action.kind === "window") {
             root.logAction("window", String(action.summary || "Changed the windows"), String(action.detail || ""))
+        } else if (action.kind === "command") {
+            // Nothing is logged here: finishNotificationCommand records the effect.
         }
         assistant.visible = false
         clickDelay.restart()
@@ -1031,6 +1099,8 @@ ShellRoot {
             screenOpen.running = true
         } else if (request.kind === "window") {
             root.runWindow(request.plan || {})
+        } else if (request.kind === "command") {
+            root.runNotificationCommand(request.command)
         } else {
             root.clickBusy = false
             root.stopAutonomy("Unsupported action")
@@ -1102,8 +1172,8 @@ ShellRoot {
             } else if (tool === "glob" || tool === "grep" || tool === "list") {
                 root.statusText = "Searching files"
                 if (event.part.state) root.collectFiles(event.part.state.output, true)
-            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control" || tool === "clipboard_history") {
-                root.statusText = tool === "open_application" ? "Preparing application" : tool === "clipboard_history" ? "Checking the clipboard history" : "Preparing action"
+            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control" || tool === "clipboard_history" || tool === "notifications") {
+                root.statusText = tool === "open_application" ? "Preparing application" : tool === "clipboard_history" ? "Checking the clipboard history" : tool === "notifications" ? "Checking notifications" : "Preparing action"
                 if (event.part.state) root.parseActionProposal(event.part.state.output)
             } else if (tool === "read_clipboard") {
                 root.statusText = "Reading the clipboard"
@@ -1462,6 +1532,9 @@ ShellRoot {
         if (screenOpen.running) screenOpen.signal(15)
         if (windowPlan.running) windowPlan.signal(15)
         if (windowRun.running) windowRun.signal(15)
+        if (clipboardHistory.running) clipboardHistory.signal(15)
+        if (notificationHistory.running) notificationHistory.signal(15)
+        if (notificationRun.running) notificationRun.signal(15)
         if (memoryRead.running) memoryRead.signal(15)
         if (memoryList.running) memoryList.signal(15)
         if (memoryWrite.running) memoryWrite.signal(15)
@@ -1556,6 +1629,34 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: notificationHistory
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 200)
+            }
+        }
+        onExited: function(exitCode, exitStatus) {}
+    }
+
+    Process {
+        id: notificationRun
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.notificationRunBuffer += line + "\n" }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 200)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishNotificationCommand(exitCode) }
     }
 
     Process {

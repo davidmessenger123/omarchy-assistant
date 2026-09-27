@@ -41,6 +41,7 @@ SETTINGS: dict[str, tuple[object, str, type, str]] = {
     "max_looks": (3, "ASSISTANT_MAX_LOOKS", int, "Model-requested screenshots allowed per user turn"),
     "screen_monitor": ("auto", "ASSISTANT_SCREEN_MONITOR", str, "Which monitor to capture: auto, cursor, focused, or a name"),
     "reminders_enabled": (True, "ASSISTANT_REMINDERS", bool, "Allow the assistant to set reminders"),
+    "notifications": (False, "ASSISTANT_NOTIFICATIONS", bool, "Record notifications so the assistant can say what the user missed"),
     "dictation_command": ("voxtype record toggle", "ASSISTANT_DICTATION_COMMAND", str, "Command run by the microphone button"),
     "keybind_combo": ("SUPER + SHIFT + Q", "ASSISTANT_KEYBIND", str, "Hyprland shortcut that launches the assistant"),
 }
