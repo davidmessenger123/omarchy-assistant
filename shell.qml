@@ -31,7 +31,7 @@ ShellRoot {
     property bool autoMode: true
     property bool autonomyActive: false
     property int autonomyStep: 0
-    readonly property int maxAutonomySteps: 8
+    property int maxAutonomySteps: 8
     property string autonomyTask: ""
     property string autonomyFeedback: ""
     property string pendingModelPrompt: ""
@@ -50,11 +50,18 @@ ShellRoot {
     property string updateBuffer: ""
     property string updateCurrent: ""
     property string updateLatest: ""
-    property string imageBackend: {
-        var configured = String(Quickshell.env("ASSISTANT_IMAGE_BACKEND") || "gemini").trim().toLowerCase()
-        return ["gemini", "local", "auto"].indexOf(configured) !== -1 ? configured : "gemini"
-    }
+    property string imageBackend: "gemini"
     readonly property string imageBackendPreference: "Image backend preference: " + root.imageBackend + ". Pass the backend argument to generate_image unless the user's request clearly calls for the other one."
+    property string model: "opencode/space-bunny-free"
+    property string modelEscalate: ""
+    property bool confirmImages: false
+    property bool clipboardEnabled: false
+    property bool remindersEnabled: true
+    property int maxLooks: 3
+    property string screenMonitor: "auto"
+    property string settingsBuffer: ""
+    property string settingsStatus: ""
+    property bool settingsLoaded: false
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
     readonly property string appDir: root.filePath(Qt.resolvedUrl("."))
@@ -203,6 +210,43 @@ ShellRoot {
     function cycleImageBackend() {
         root.imageBackend = root.imageBackend === "gemini" ? "local" : root.imageBackend === "local" ? "auto" : "gemini"
         root.statusText = "Image backend: " + root.imageBackend
+        root.saveSetting("image_backend", root.imageBackend)
+    }
+
+    function applySettings(text) {
+        var parsed = null
+        try {
+            parsed = JSON.parse(String(text || "").trim())
+        } catch (error) {
+            parsed = null
+        }
+        if (!parsed || typeof parsed !== "object") {
+            root.settingsStatus = "Settings could not be read; using built-in defaults."
+            return
+        }
+        var backends = ["gemini", "local", "auto"]
+        if (backends.indexOf(String(parsed.image_backend || "")) !== -1) root.imageBackend = String(parsed.image_backend)
+        if (parsed.model) root.model = String(parsed.model)
+        root.modelEscalate = String(parsed.model_escalate || "")
+        root.confirmImages = parsed.confirm_images === true
+        root.clipboardEnabled = parsed.clipboard_enabled === true
+        root.remindersEnabled = parsed.reminders_enabled !== false
+        var steps = parseInt(parsed.max_autonomy_steps, 10)
+        if (isFinite(steps) && steps > 0) root.maxAutonomySteps = steps
+        var looks = parseInt(parsed.max_looks, 10)
+        if (isFinite(looks) && looks > 0) root.maxLooks = looks
+        if (parsed.screen_monitor) root.screenMonitor = String(parsed.screen_monitor)
+        root.settingsLoaded = true
+    }
+
+    function readSettings() {
+        settingsRead.command = ["/usr/bin/python3", root.appDir + "/assistant_config.py", "--format", "json"]
+        settingsRead.running = true
+    }
+
+    function saveSetting(key, value) {
+        settingsWrite.command = ["/usr/bin/python3", root.appDir + "/assistant_config.py", "set", key, String(value)]
+        settingsWrite.running = true
     }
 
     function isImagePath(value) {
@@ -425,14 +469,14 @@ ShellRoot {
         var command
         if (screenshotPath) {
             if (root.sessionId) {
-                command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --session \"$4\" --file \"$5\" -- \"$6\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", root.sessionId, screenshotPath, modelPrompt]
+                command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$7\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --session \"$4\" --file \"$5\" -- \"$6\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", root.sessionId, screenshotPath, modelPrompt, root.model]
             } else {
-                command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --file \"$4\" -- \"$5\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", screenshotPath, modelPrompt]
+                command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$6\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --file \"$4\" -- \"$5\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", screenshotPath, modelPrompt, root.model]
             }
         } else if (root.sessionId) {
-            command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --session \"$4\" \"$5\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", root.sessionId, modelPrompt]
+            command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$6\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --session \"$4\" \"$5\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", root.sessionId, modelPrompt, root.model]
         } else {
-            command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" \"$4\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", modelPrompt]
+            command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$5\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" \"$4\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", modelPrompt, root.model]
         }
         opencode.command = command
         opencode.running = true
@@ -939,6 +983,35 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: settingsRead
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.settingsBuffer += line }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.settingsStatus = value.slice(0, 200)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.applySettings(root.settingsBuffer) }
+    }
+
+    Process {
+        id: settingsWrite
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.settingsStatus = String(line || "").trim() }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.settingsStatus = value.slice(0, 200)
+            }
+        }
     }
 
     Process {
@@ -1773,6 +1846,7 @@ ShellRoot {
     Component.onCompleted: {
         addMessage("assistant", "Ask me anything. I can search the web, read-only files under /home, use the screen when relevant, open installed apps, and continue guarded computer tasks when Auto is enabled. I remember local preferences and conversation context.")
         root.cleanupScreen()
+        root.readSettings()
         root.refreshMemory()
         Qt.callLater(function() { input.forceActiveFocus() })
     }

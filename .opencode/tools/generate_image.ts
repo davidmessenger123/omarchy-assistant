@@ -4,13 +4,31 @@ import { access, chmod, copyFile, mkdir, readFile, rename, unlink, writeFile } f
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
-// Read per call rather than at import time so a restarted assistant, a test, or a
-// changed environment always sees the current settings.
-const geminiModel = () => process.env.ASSISTANT_IMAGE_MODEL || "gemini-3-pro-image"
-const geminiEndpoint = () => (process.env.ASSISTANT_GEMINI_ENDPOINT || "https://generativelanguage.googleapis.com/v1beta").replace(/\/+$/, "")
-const localModel = () => process.env.ASSISTANT_IMAGE_LOCAL_MODEL || "stabilityai/sdxl-turbo"
-const localPython = () => process.env.ASSISTANT_IMAGE_PYTHON || join(homedir(), ".local", "share", "omarchy-assistant", "image-venv", "bin", "python")
-const preferredBackend = () => String(process.env.ASSISTANT_IMAGE_BACKEND || "gemini").trim().toLowerCase()
+// Settings come from assistant_config.py: environment first, then
+// ~/.config/omarchy-assistant/config.json, then these defaults. Everything is
+// resolved per call so a changed setting or a restart takes effect immediately.
+const configPath = process.env.ASSISTANT_CONFIG || join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "omarchy-assistant", "config.json")
+type Settings = Record<string, unknown>
+let cachedSettings: Settings | null = null
+
+async function loadSettings(): Promise<Settings> {
+    if (cachedSettings) return cachedSettings
+    cachedSettings = {}
+    try {
+        const parsed = JSON.parse(await readFile(configPath, "utf8"))
+        if (parsed && typeof parsed === "object") cachedSettings = parsed
+    } catch {}
+    return cachedSettings
+}
+
+function setting(settings: Settings, envName: string, key: string, fallback: unknown) {
+    const fromEnv = process.env[envName]
+    if (fromEnv !== undefined && String(fromEnv) !== "") return fromEnv
+    const fromFile = settings[key]
+    if (fromFile !== undefined && fromFile !== null && String(fromFile) !== "") return fromFile
+    return fallback
+}
+
 const aspectRatios = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
 const resolutions = ["1K", "2K", "4K"]
 const maxBytes = 64 * 1024 * 1024
@@ -53,8 +71,8 @@ async function resolveKey() {
     return { key: "", source: file, file }
 }
 
-async function outputDir() {
-    const override = firstLine(process.env.ASSISTANT_IMAGE_DIR)
+async function outputDir(settings: Settings) {
+    const override = firstLine(setting(settings, "ASSISTANT_IMAGE_DIR", "image_dir", ""))
     if (override) return expandHome(override)
     const configured = firstLine(process.env.XDG_PICTURES_DIR)
     if (configured) return join(expandHome(configured), "omarchy-assistant")
@@ -66,9 +84,9 @@ async function outputDir() {
     return join(homedir(), "Pictures", "omarchy-assistant")
 }
 
-async function recordAttempt() {
-    const hourly = limit("ASSISTANT_IMAGE_HOURLY_LIMIT", 10)
-    const daily = limit("ASSISTANT_IMAGE_DAILY_LIMIT", 60)
+async function recordAttempt(settings: Settings) {
+    const hourly = limit("ASSISTANT_IMAGE_HOURLY_LIMIT", Number(setting(settings, "", "image_hourly_limit", 10)))
+    const daily = limit("ASSISTANT_IMAGE_DAILY_LIMIT", Number(setting(settings, "", "image_daily_limit", 60)))
     const file = join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "omarchy-assistant", "image-usage.json")
     const now = Date.now()
     let stamps: number[] = []
@@ -110,14 +128,14 @@ async function saveImage(source: string, dir: string, name: string) {
     return path
 }
 
-async function generateWithGemini(credential: { key: string }, prompt: string, aspectRatio: string, resolution: string, filenameHint: string) {
+async function generateWithGemini(options: { key: string; model: string; endpoint: string; timeoutMs: number; settings: Settings }, prompt: string, aspectRatio: string, resolution: string, filenameHint: string) {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), limit("ASSISTANT_IMAGE_TIMEOUT_MS", 300000))
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs)
     let data: any = null
     try {
-        const response = await fetch(`${geminiEndpoint()}/models/${geminiModel()}:generateContent`, {
+        const response = await fetch(`${options.endpoint}/models/${options.model}:generateContent`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-goog-api-key": credential.key },
+            headers: { "content-type": "application/json", "x-goog-api-key": options.key },
             body: JSON.stringify({
                 contents: [{ role: "user", parts: [{ text: prompt }] }],
                 generationConfig: {
@@ -164,7 +182,7 @@ async function generateWithGemini(credential: { key: string }, prompt: string, a
     if (!extension) return { ok: false, error: `Gemini returned an unsupported image type (${mime || "unknown"}).` }
     if (inline.data.length > Math.ceil(maxBytes * 1.4)) return { ok: false, error: "The generated image is larger than the 64 MB limit." }
 
-    const dir = await outputDir()
+    const dir = await outputDir(options.settings)
     const path = join(dir, `${slug(filenameHint || prompt)}-${stamp()}${extension}`)
     try {
         await mkdir(dir, { recursive: true, mode: 0o755 })
@@ -178,16 +196,16 @@ async function generateWithGemini(credential: { key: string }, prompt: string, a
         path,
         mime,
         bytes: Buffer.from(inline.data, "base64").length,
-        model: geminiModel(),
+        model: options.model,
         aspect_ratio: aspectRatio,
         resolution,
         caption: caption.slice(0, 800)
     }
 }
 
-function runLocal(request: Record<string, unknown>, timeoutMs: number) {
+function runLocal(python: string, request: Record<string, unknown>, timeoutMs: number) {
     return new Promise<{ stdout: string; stderr: string; code: number | null; error?: string }>((resolve) => {
-        const child = spawn(localPython(), [join(process.env.ASSISTANT_APP_DIR || process.cwd(), "assistant_image_local.py"), "generate"], {
+        const child = spawn(python, [join(process.env.ASSISTANT_APP_DIR || process.cwd(), "assistant_image_local.py"), "generate"], {
             stdio: ["pipe", "pipe", "pipe"]
         })
         let stdout = ""
@@ -214,9 +232,8 @@ function runLocal(request: Record<string, unknown>, timeoutMs: number) {
     })
 }
 
-async function generateLocally(prompt: string, aspectRatio: string, steps: number, filenameHint: string) {
-    const timeoutMs = limit("ASSISTANT_IMAGE_LOCAL_TIMEOUT_MS", 3600000)
-    const result = await runLocal({ prompt, aspect_ratio: aspectRatio, steps, model: localModel() }, timeoutMs)
+async function generateLocally(options: { python: string; model: string; timeoutMs: number }, prompt: string, aspectRatio: string, steps: number, filenameHint: string) {
+    const result = await runLocal(options.python, { prompt, aspect_ratio: aspectRatio, steps, model: options.model }, options.timeoutMs)
     if (result.error) return { ok: false, error: result.error }
     // The helper prints one JSON object, but libraries can emit stray lines, so
     // read the last line that parses as JSON rather than the whole stream.
@@ -239,7 +256,7 @@ async function generateLocally(prompt: string, aspectRatio: string, steps: numbe
     if (parsed.ok !== true) {
         return { ok: false, error: firstLine(parsed.error) || "Local generation failed." }
     }
-    const dir = await outputDir()
+    const dir = await outputDir(options.settings)
     const name = `${slug(filenameHint || prompt)}-${stamp()}.png`
     try {
         const path = await saveImage(parsed.path, dir, name)
@@ -275,6 +292,7 @@ export default tool({
         filename: tool.schema.string().describe("Optional short words describing the image, used to build the saved filename.")
     },
     async execute(args) {
+        const settings = await loadSettings()
         const prompt = String(args.prompt || "").trim()
         if (prompt.length < 3 || prompt.length > 4000) return failure("Give an image prompt between 3 and 4000 characters.")
         const aspectRatio = String(args.aspect_ratio || "1:1").trim()
@@ -283,13 +301,15 @@ export default tool({
         if (!resolutions.includes(resolution)) return failure(`Use one of these resolutions: ${resolutions.join(", ")}.`)
         const requestedSteps = Number(args.steps)
         const steps = Number.isFinite(requestedSteps) && requestedSteps > 0 ? Math.max(1, Math.min(Math.round(requestedSteps), 4)) : 2
-        const requested = String(args.backend || preferredBackend() || "gemini").trim().toLowerCase()
+        const preferred = String(setting(settings, "ASSISTANT_IMAGE_BACKEND", "image_backend", "gemini")).trim().toLowerCase()
+        const requested = String(args.backend || preferred || "gemini").trim().toLowerCase()
         if (!["gemini", "local", "auto"].includes(requested)) return failure("Use backend gemini, local, or auto.")
 
+        const python = String(setting(settings, "ASSISTANT_IMAGE_PYTHON", "", process.env.ASSISTANT_IMAGE_PYTHON || join(homedir(), ".local", "share", "omarchy-assistant", "image-venv", "bin", "python")))
         const credential = await resolveKey()
         let localReady = true
         try {
-            await access(localPython())
+            await access(python)
         } catch {
             localReady = false
         }
@@ -305,14 +325,41 @@ export default tool({
             return failure("The local image backend is not installed. Ask the user to run bin/assistant-config setup-image-models; the first run also downloads several GB of weights.", { configured: false })
         }
 
-        const limited = await recordAttempt()
+        const limited = await recordAttempt(settings)
         if (limited) return failure(limited)
 
-        if (backend === "local") return JSON.stringify(await generateLocally(prompt, aspectRatio, steps, String(args.filename || "").trim()))
+        if (backend === "local") {
+            return JSON.stringify(
+                await generateLocally(
+                    {
+                        python,
+                        model: String(setting(settings, "ASSISTANT_IMAGE_LOCAL_MODEL", "image_model_local", "stabilityai/sdxl-turbo")),
+                        timeoutMs: limit("ASSISTANT_IMAGE_LOCAL_TIMEOUT_MS", Number(setting(settings, "", "image_local_timeout_ms", 3600000))),
+                        settings
+                    },
+                    prompt,
+                    aspectRatio,
+                    steps,
+                    String(args.filename || "").trim()
+                )
+            )
+        }
         if (!credential.key) {
             return failure("Image generation is not configured. Ask the user to run bin/assistant-config set-key in the assistant directory, or to export GEMINI_API_KEY, then try again. The local backend is also available after bin/assistant-config setup-image-models.", { configured: false })
         }
-        const result = await generateWithGemini(credential, prompt, aspectRatio, resolution, String(args.filename || "").trim())
+        const result = await generateWithGemini(
+            {
+                key: credential.key,
+                model: String(setting(settings, "ASSISTANT_IMAGE_MODEL", "image_model_gemini", "gemini-3-pro-image")),
+                endpoint: String(setting(settings, "ASSISTANT_GEMINI_ENDPOINT", "", process.env.ASSISTANT_GEMINI_ENDPOINT || "https://generativelanguage.googleapis.com/v1beta")).replace(/\/+$/, ""),
+                timeoutMs: limit("ASSISTANT_IMAGE_TIMEOUT_MS", Number(setting(settings, "", "image_timeout_ms", 300000))),
+                settings
+            },
+            prompt,
+            aspectRatio,
+            resolution,
+            String(args.filename || "").trim()
+        )
         if (!result.ok) return failure(result.error as string, { backend: "gemini" })
         return JSON.stringify({ action: "generate_image", ...result })
     }

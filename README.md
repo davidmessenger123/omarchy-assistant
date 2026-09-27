@@ -66,6 +66,28 @@ The installer reloads Hyprland for you, so the shortcut works right away. Launch
 
 For synthetic clicking, ensure the user can access `/dev/uinput` using the system's udev/ACL policy. The assistant refuses to silently fall back to unrestricted input.
 
+## Settings
+
+Behaviour lives in `~/.config/omarchy-assistant/config.json`, created automatically the first time you change a setting in the app. Environment variables win over the file, and the built-in defaults win over nothing, so a one-off export always beats a saved preference.
+
+```bash
+./assistant_config.py --format json      # effective settings
+./assistant_config.py keys               # every key, its env var, and default
+./assistant_config.py get image_backend
+./assistant_config.py set confirm_images true
+./assistant_config.py set max_autonomy_steps 12
+```
+
+Keys cover the chat model and the optional escalate model, the image backend, both image model ids, the image directory, rate limits, timeouts, `confirm_images`, `clipboard_enabled`, `max_autonomy_steps`, `max_looks`, `screen_monitor`, `reminders_enabled`, `dictation_command`, and `keybind_combo`. A file that is not valid JSON is reported and ignored rather than breaking the app.
+
+## Checking an installation
+
+```bash
+./bin/assistant-doctor            # add --quiet for only problems, --network to test reachability
+```
+
+It verifies required commands, `/dev/uinput` access, venv support, the settings file, the Hyprland config and keybinding, the git checkout and whether it is behind `origin`, the OpenCode install and model list, the Gemini key (without printing it), the local image backend including GPU runtime and cached weights, free disk space, and that screen capture actually works. It changes nothing and exits non-zero if any check fails.
+
 ## Image generation
 
 The chat model (Space Bunny) cannot create images, so the Assistant calls a dedicated `generate_image` tool. Ask for an image in plain language, for example "draw a watercolour of a lighthouse at dusk in 16:9". The Assistant picks the aspect ratio, saves the file under `~/Pictures/omarchy-assistant/`, and shows the image inline with an **Open** button. This version generates new images only; it cannot edit an existing image.

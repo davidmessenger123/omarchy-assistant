@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Report whether this machine is ready to run the Omarchy Assistant.
+#
+# Prints one key=value line per check, then a summary, and exits non-zero when
+# any check fails. Safe to run at any time; it never changes anything.
+set -uo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+app_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+helper="$app_dir/assistant_config.py"
+local_helper="$app_dir/assistant_image_local.py"
+keybind="$script_dir/install-keybind"
+
+checks=0
+failures=0
+warnings=0
+network=0
+show_all=1
+
+usage() {
+    cat <<'EOF'
+Usage: assistant-doctor [options]
+
+  --network   Also test that the Gemini endpoint is reachable over the network
+  --quiet     Only print failed and warning checks, plus the summary
+  -h, --help  Show this help
+EOF
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --network) network=1 ;;
+        --quiet) show_all=0 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+report() {
+    local name="$1" status="$2" detail="${3:-}"
+    checks=$((checks + 1))
+    case "$status" in
+        fail)
+            failures=$((failures + 1))
+            ;;
+        warn) warnings=$((warnings + 1)) ;;
+    esac
+    if ((show_all)) || [[ "$status" != "ok" ]]; then
+        printf '%-22s %-5s %s\n' "$name" "$status" "$detail"
+    fi
+}
+
+printf 'Omarchy Assistant doctor\n'
+printf 'repo=%s\n\n' "$app_dir"
+
+missing=()
+for command_name in quickshell opencode python3 node npm git hyprctl wtype uwsm-app xdg-open; do
+    command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+done
+if ((${#missing[@]} > 0)); then
+    report commands fail "missing: ${missing[*]}"
+else
+    report commands ok "all required commands present"
+fi
+
+if [[ -e /dev/uinput ]]; then
+    if [[ -r /dev/uinput && -w /dev/uinput ]]; then
+        report uinput ok "/dev/uinput is readable and writable"
+    else
+        report uinput warn "/dev/uinput exists but permissions are limited; clicking will not work"
+    fi
+else
+    report uinput warn "/dev/uinput is missing; autonomous clicking will not work"
+fi
+
+if python3 -c 'import venv' >/dev/null 2>&1; then
+    report python-venv ok "python3 can create virtual environments"
+else
+    report python-venv warn "python3 cannot create venvs (Arch: pacman -S python; Debian: python3-venv)"
+fi
+
+settings_json=""
+if [[ -x "$helper" ]] || command -v python3 >/dev/null 2>&1; then
+    settings_json="$(python3 "$helper" --format json 2>/dev/null || true)"
+fi
+settings_value() {
+    printf '%s' "$settings_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('$1', ''))" 2>/dev/null || true
+}
+
+if [[ -n "$settings_json" ]]; then
+    config_path="$(python3 "$helper" path 2>/dev/null || echo unknown)"
+    if [[ -e "$config_path" ]]; then
+        report settings ok "using $config_path"
+    else
+        report settings ok "using defaults (no $config_path yet)"
+    fi
+    settings_warnings="$(python3 "$helper" --format json 2>&1 >/dev/null || true)"
+    if [[ -n "$settings_warnings" ]]; then
+        report settings warn "$settings_warnings"
+    fi
+else
+    report settings fail "could not read settings from $helper"
+fi
+
+combo="$(settings_value keybind_combo)"
+[[ -n "$combo" ]] || combo="SUPER + SHIFT + Q"
+
+if command -v hyprctl >/dev/null 2>&1; then
+    if hyprctl version >/dev/null 2>&1; then
+        config_errors="$(hyprctl configerrors 2>/dev/null | tr -d '[:space:]')"
+        if [[ -z "$config_errors" ]]; then
+            report hyprland ok "running, config is valid"
+        else
+            report hyprland warn "hyprctl configerrors is not empty: $config_errors"
+        fi
+    else
+        report hyprland warn "hyprctl is installed but no session is running"
+    fi
+    binding_found=0
+    while IFS= read -r line; do
+        [[ "$line" == *"Omarchy Assistant"* ]] && binding_found=1
+    done < <(hyprctl binds -j 2>/dev/null | tr '{' '\n' || true)
+    if ((binding_found)); then
+        report keybind ok "$combo launches the assistant"
+    else
+        report keybind warn "$combo is not bound; run $keybind"
+    fi
+else
+    report hyprland warn "hyprctl not found, so this is not a Hyprland session"
+    report keybind warn "not checked without hyprctl"
+fi
+
+if git -C "$app_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    remote="$(git -C "$app_dir" remote get-url origin 2>/dev/null || echo none)"
+    branch="$(git -C "$app_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    head_short="$(git -C "$app_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    detail="branch=$branch head=$head_short remote=$remote"
+    if [[ -n "$(git -C "$app_dir" status --porcelain 2>/dev/null)" ]]; then
+        report repo warn "$detail (uncommitted changes block the Update button)"
+    else
+        report repo ok "$detail"
+    fi
+    if [[ -x "$app_dir/assistant_update.py" ]]; then
+        update_line="$(python3 "$app_dir/assistant_update.py" check --dir "$app_dir" 2>/dev/null || true)"
+        if [[ -n "$update_line" ]]; then
+            latest="$(printf '%s' "$update_line" | python3 -c "import json,sys; print(json.load(sys.stdin).get('latest','')[:7])" 2>/dev/null || true)"
+            if [[ -n "$latest" && "$latest" != "$head_short" ]]; then
+                report update warn "origin is ahead: local $head_short, remote $latest"
+            else
+                report update ok "up to date with origin"
+            fi
+        fi
+    fi
+else
+    report repo warn "not a git checkout, so the Update button cannot work"
+fi
+
+if command -v opencode >/dev/null 2>&1; then
+    opencode_version="$(opencode --version 2>/dev/null | head -n 1 || true)"
+    model_count="$(opencode models 2>/dev/null | wc -l || echo 0)"
+    if ((model_count > 0)); then
+        report opencode ok "${opencode_version:-installed}, $model_count models available"
+    else
+        report opencode warn "${opencode_version:-installed}, but no models are listed; check your provider"
+    fi
+else
+    report opencode fail "opencode is not installed"
+fi
+
+key_file="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-assistant/gemini.key"
+if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    report gemini-key ok "provided by the GEMINI_API_KEY environment variable"
+elif [[ -r "$key_file" && -s "$key_file" ]]; then
+    report gemini-key ok "stored in $key_file"
+else
+    report gemini-key warn "not configured; run bin/assistant-config set-key for the Gemini backend"
+fi
+
+image_python="$(settings_value image_python)"
+if [[ -z "$image_python" ]]; then
+    image_python="${ASSISTANT_IMAGE_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-assistant/image-venv/bin/python}"
+fi
+if [[ -x "$image_python" ]] && [[ -f "$local_helper" ]]; then
+    doctor_json="$("$image_python" "$local_helper" doctor 2>/dev/null || true)"
+    if [[ -n "$doctor_json" ]]; then
+        summary="$(printf '%s' "$doctor_json" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print('could not parse the doctor report')
+    raise SystemExit
+bits = []
+runtime = data.get('runtime', 'unknown')
+bits.append('runtime=' + runtime)
+if data.get('device'):
+    bits.append('device=' + str(data['device']))
+if data.get('vram_gb'):
+    bits.append('vram=' + str(data['vram_gb']) + 'GB')
+if data.get('hip'):
+    bits.append('hip=' + str(data['hip']))
+if data.get('cuda'):
+    bits.append('cuda=' + str(data['cuda']))
+bits.append('weights=' + ('cached' if data.get('weights_cached') else 'missing'))
+warnings = data.get('warnings') or []
+print(' '.join(bits))
+for warning in warnings:
+    print('WARN ' + str(warning))
+" 2>/dev/null || printf 'doctor report unavailable')"
+        first_line="${summary%%WARN*}"
+        first_line="$(printf '%s' "$first_line" | tr -s ' ' | sed 's/^ //;s/ $//')"
+        if [[ "$first_line" == *"runtime=cpu"* ]]; then
+            report local-backend fail "$first_line"
+        elif [[ "$first_line" == *"weights=missing"* ]]; then
+            report local-backend warn "$first_line"
+        else
+            report local-backend ok "$first_line"
+        fi
+        while IFS= read -r warning_line; do
+            [[ -n "$warning_line" ]] && report local-backend-note warn "${warning_line#WARN }"
+        done < <(printf '%s\n' "$summary" | grep '^WARN ' || true)
+    else
+        report local-backend fail "the local environment exists but the doctor command failed"
+    fi
+else
+    report local-backend warn "not installed; run bin/assistant-config setup-image-models"
+fi
+
+free_gb="$(df -BG --output=avail "$app_dir" 2>/dev/null | tail -n 1 | tr -dc '0-9')"
+if [[ -n "$free_gb" ]]; then
+    if ((free_gb >= 20)); then
+        report disk ok "${free_gb} GB free"
+    else
+        report disk warn "${free_gb} GB free; the local image model needs about 13 GB"
+    fi
+else
+    report disk warn "could not read free space"
+fi
+
+if [[ -x "$script_dir/screen_capture" ]]; then
+    probe="$(mktemp -t assistant-doctor-XXXXXX.png 2>/dev/null || true)"
+    if [[ -n "$probe" ]] && "$script_dir/screen_capture" "$probe" >/dev/null 2>&1 && [[ -s "$probe" ]]; then
+        if [[ "$(head -c 4 "$probe" | od -An -tx1 | tr -d ' \n')" == "89504e47" ]]; then
+            report capture ok "screen capture works"
+        else
+            report capture fail "capture produced a file that is not a PNG"
+        fi
+    else
+        report capture fail "screen capture failed; check bin/screen_capture"
+    fi
+    rm -f "$probe"
+else
+    report capture fail "bin/screen_capture is missing or not executable"
+fi
+
+if ((network)); then
+    if curl -s -m 10 -o /dev/null https://generativelanguage.googleapis.com 2>/dev/null; then
+        report network ok "the Gemini endpoint is reachable"
+    else
+        report network warn "could not reach generativelanguage.googleapis.com"
+    fi
+fi
+
+printf '\n%d checks, %d failed, %d warnings\n' "$checks" "$failures" "$warnings"
+if ((failures > 0)); then
+    printf 'Result: not ready. Fix the failed checks above.\n'
+    exit 1
+fi
+if ((warnings > 0)); then
+    printf 'Result: usable, with warnings worth reading.\n'
+else
+    printf 'Result: everything looks good.\n'
+fi
+exit 0
