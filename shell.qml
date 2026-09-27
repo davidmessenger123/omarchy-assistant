@@ -281,7 +281,11 @@ ShellRoot {
 
     function toggleModelPanel() {
         root.modelPanelVisible = !root.modelPanelVisible
-        if (root.modelPanelVisible) root.readModelList()
+        if (root.modelPanelVisible) {
+            root.historyVisible = false
+            root.memoryVisible = false
+            root.readModelList()
+        }
     }
 
     function chooseModel(id) {
@@ -308,6 +312,21 @@ ShellRoot {
         root.statusText = "Asking again with " + root.modelEscalate
         root.logAction("settings", "Escalated the last answer to " + root.modelEscalate, String(root.lastUserPrompt).slice(0, 80))
         root.finishSend()
+    }
+
+    function statusLine() {
+        var parts = [root.statusText, root.autoMode ? "Auto" : "Manual actions", "Model: " + root.shortModel()]
+        if (root.modelPanelVisible) parts.push("model list open")
+        if (root.autonomyActive) parts.push("Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps)
+        if (root.screenAttached || root.forceScreen) parts.push("Screen context")
+        if (root.pendingClick !== null) parts.push("Confirmation")
+        if (root.pendingImage !== null) parts.push("Image approval")
+        if (root.memoryCount > 0) parts.push("Memory " + root.memoryCount)
+        if (root.activeSources.length > 0) parts.push(root.activeSources.length + (root.activeSources.length === 1 ? " source" : " sources"))
+        if (root.activeFiles.length > 0) parts.push(root.activeFiles.length + (root.activeFiles.length === 1 ? " file" : " files"))
+        if (root.attachedImage !== "") parts.push("Image attached")
+        parts.push("Enter to send", "Ctrl+. stop task", "Ctrl+L new chat", "Esc close")
+        return parts.join("  •  ")
     }
 
     function shortModel() {
@@ -356,7 +375,12 @@ ShellRoot {
     function toggleHistory() {
         root.historyVisible = !root.historyVisible
         root.clearHistoryArmed = false
-        if (root.historyVisible) root.refreshHistory()
+        if (root.historyVisible) {
+            // Panels share the space above the input, so only one stays open.
+            root.modelPanelVisible = false
+            root.memoryVisible = false
+            root.refreshHistory()
+        }
     }
 
     function clearHistory() {
@@ -1710,7 +1734,11 @@ ShellRoot {
                         onClicked: {
                             root.memoryVisible = !root.memoryVisible
                             root.clearArmed = false
-                            if (root.memoryVisible) root.refreshMemory()
+                            if (root.memoryVisible) {
+                                root.historyVisible = false
+                                root.modelPanelVisible = false
+                                root.refreshMemory()
+                            }
                             input.forceActiveFocus()
                         }
                         contentItem: Text {
@@ -1889,6 +1917,7 @@ ShellRoot {
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+                    Layout.minimumHeight: 150
                     radius: 16
                     color: "#10151E"
                     border.width: 1
@@ -2742,7 +2771,7 @@ ShellRoot {
 
                 Text {
                     Layout.fillWidth: true
-                    text: root.statusText + (root.autoMode ? "  •  Auto" : "  •  Manual actions") + "  •  Model: " + root.shortModel() + (root.modelPanelVisible ? " ▾" : "") + (root.autonomyActive ? "  •  Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps : "") + (root.screenAttached || root.forceScreen ? "  •  Screen context" : "") + (root.pendingClick !== null ? "  •  Confirmation" : "") + (root.pendingImage !== null ? "  •  Image approval" : "") + (root.memoryCount > 0 ? "  •  Memory " + root.memoryCount : "") + (root.activeSources.length > 0 ? "  •  " + root.activeSources.length + " source" + (root.activeSources.length === 1 ? "" : "s") : "") + (root.activeFiles.length > 0 ? "  •  " + root.activeFiles.length + " file" + (root.activeFiles.length === 1 ? "" : "s") : "") + "  •  Enter to send  •  Ctrl+. stop task  •  Ctrl+L new chat  •  Esc close"
+                    text: root.statusLine()
                     color: "#7F8B9D"
                     font.family: "Sans Serif"
                     font.pixelSize: 11
