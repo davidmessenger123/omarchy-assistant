@@ -15,7 +15,7 @@ The assistant never edits files or runs arbitrary shell commands. Computer actio
 
 - Arch/Omarchy with Hyprland and Quickshell
 - `opencode` installed and authenticated
-- `node`, `npm`, `python3`, `wtype`, `uwsm-app`, `hyprctl`, and `xdg-open`
+- `node`, `npm`, `git`, `python3`, `wtype`, `uwsm-app`, `hyprctl`, and `xdg-open`
 - `/dev/uinput` access for synthetic mouse input
 
 The repository includes an x86-64 capture helper at `bin/screen_capture-x86_64`. The `bin/screen_capture` wrapper uses it on x86-64 and falls back to the system `grim` on other CPU architectures. The rest of the project is source-level and portable.
@@ -41,6 +41,10 @@ o.bind("SUPER + SHIFT + Q", "Omarchy Assistant", {
 Reload Hyprland, then launch with `run.sh` or the binding.
 
 For synthetic clicking, ensure the user can access `/dev/uinput` using the system's udev/ACL policy. The assistant refuses to silently fall back to unrestricted input.
+
+## Updates
+
+The **Update** button checks the current `origin` branch on GitHub without changing the checkout. If the branch is behind and the working tree is clean, **Update now** performs a fast-forward pull, refreshes the project-local OpenCode dependency, and restarts the assistant. Local uncommitted changes block applying an update; commit or stash them first.
 
 ## Memory
 

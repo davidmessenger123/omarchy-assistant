@@ -43,6 +43,13 @@ ShellRoot {
     property int memoryCount: 0
     property bool memoryVisible: false
     property bool clearArmed: false
+    property bool updateBusy: false
+    property bool updateAvailable: false
+    property bool updatePanelVisible: false
+    property string updateStatus: ""
+    property string updateBuffer: ""
+    property string updateCurrent: ""
+    property string updateLatest: ""
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
     readonly property string appDir: root.filePath(Qt.resolvedUrl("."))
@@ -326,6 +333,64 @@ ShellRoot {
         }
         root.refreshMemory()
         root.statusText = parsed && parsed.ok === false ? "Memory not saved" : "Memory updated"
+    }
+
+    function checkUpdate() {
+        if (root.updateBusy || updateCheck.running) return
+        root.updateBusy = true
+        root.updateAvailable = false
+        root.updatePanelVisible = true
+        root.updateStatus = "Checking GitHub…"
+        root.updateBuffer = ""
+        updateCheck.command = ["/usr/bin/python3", root.appDir + "/assistant_update.py", "check", "--dir", root.appDir]
+        updateCheck.running = true
+    }
+
+    function finishUpdateCheck() {
+        root.updateBusy = false
+        var parsed = null
+        try {
+            parsed = JSON.parse(root.updateBuffer.trim())
+        } catch (error) {
+            parsed = null
+        }
+        if (!parsed || parsed.ok !== true) {
+            root.updateStatus = parsed && parsed.error ? parsed.error : "Could not check GitHub"
+            return
+        }
+        root.updateCurrent = String(parsed.current || "")
+        root.updateLatest = String(parsed.latest || "")
+        root.updateAvailable = parsed.updateAvailable === true
+        if (parsed.dirty) root.updateStatus = "Local changes present; update is blocked"
+        else if (root.updateAvailable) root.updateStatus = "Update available: " + root.updateLatest.slice(0, 7)
+        else root.updateStatus = "Up to date"
+    }
+
+    function applyUpdate() {
+        if (root.updateBusy || updateApply.running || !root.updateAvailable) return
+        root.updateBusy = true
+        root.updateStatus = "Updating from GitHub…"
+        root.updateBuffer = ""
+        updateApply.command = ["/usr/bin/python3", root.appDir + "/assistant_update.py", "update", "--dir", root.appDir]
+        updateApply.running = true
+    }
+
+    function finishUpdateApply() {
+        root.updateBusy = false
+        var parsed = null
+        try {
+            parsed = JSON.parse(root.updateBuffer.trim())
+        } catch (error) {
+            parsed = null
+        }
+        if (!parsed || parsed.ok !== true) {
+            root.updateStatus = parsed && parsed.error ? parsed.error : "Update failed"
+            return
+        }
+        root.updateCurrent = String(parsed.current || "")
+        root.updateAvailable = false
+        root.updateStatus = "Updated; restarting assistant…"
+        updateRestartDelay.restart()
     }
 
     function startRequest(prompt, screenshotPath) {
@@ -770,6 +835,9 @@ ShellRoot {
         if (memoryRead.running) memoryRead.signal(15)
         if (memoryList.running) memoryList.signal(15)
         if (memoryWrite.running) memoryWrite.signal(15)
+        if (updateCheck.running) updateCheck.signal(15)
+        if (updateApply.running) updateApply.signal(15)
+        updateRestartDelay.stop()
         if (opencode.running) opencode.signal(15)
         root.pendingClick = null
         root.proposedAction = null
@@ -901,6 +969,36 @@ ShellRoot {
         onExited: function(exitCode, exitStatus) { root.finishMemoryWrite() }
     }
 
+    Process {
+        id: updateCheck
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.updateBuffer += line }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.updateStatus = value.slice(0, 1000)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishUpdateCheck() }
+    }
+
+    Process {
+        id: updateApply
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.updateBuffer += line }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.updateStatus = value.slice(0, 1000)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishUpdateApply() }
+    }
+
     Timer {
         id: screenCaptureDelay
         interval: 200
@@ -922,6 +1020,16 @@ ShellRoot {
         interval: 200
         repeat: false
         onTriggered: root.runClick()
+    }
+
+    Timer {
+        id: updateRestartDelay
+        interval: 900
+        repeat: false
+        onTriggered: {
+            Quickshell.execDetached(["/bin/sh", "-c", "sleep 1; exec \"$1\"", "assistant", root.appDir + "/run.sh"])
+            Qt.quit()
+        }
     }
 
     PanelWindow {
@@ -1101,6 +1209,30 @@ ShellRoot {
                     }
 
                     Button {
+                        id: updateButton
+                        text: root.updateBusy ? "Checking" : root.updateAvailable ? "Update!" : "Update"
+                        onClicked: {
+                            if (root.updateAvailable) root.applyUpdate()
+                            else root.checkUpdate()
+                            input.forceActiveFocus()
+                        }
+                        enabled: !root.busy && !root.clickBusy && !root.updateBusy
+                        contentItem: Text {
+                            text: updateButton.text
+                            color: updateButton.enabled ? (root.updateAvailable ? "#9FE0C0" : "#DCE5F2") : "#657083"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 10
+                            color: root.updateAvailable ? "#1D3A38" : "#273247"
+                            border.color: root.updateAvailable ? "#477D6C" : "#3A465B"
+                        }
+                    }
+
+                    Button {
                         id: closeButton
                         text: "Close"
                         onClicked: root.closeAssistant()
@@ -1116,6 +1248,52 @@ ShellRoot {
                             radius: 10
                             color: "#273247"
                             border.color: "#3A465B"
+                        }
+                    }
+                }
+
+                Rectangle {
+                    id: updatePanel
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: root.updatePanelVisible ? 42 : 0
+                    visible: root.updatePanelVisible
+                    radius: 10
+                    color: "#202B38"
+                    border.width: 1
+                    border.color: root.updateAvailable ? "#477D6C" : "#3A4A5E"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 8
+                        Text {
+                            Layout.fillWidth: true
+                            text: root.updateStatus
+                            color: root.updateAvailable ? "#DCF3E7" : "#DCE5F2"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        Button {
+                            id: updateNowButton
+                            text: "Update now"
+                            visible: root.updateAvailable && !root.updateBusy
+                            onClicked: root.applyUpdate()
+                            contentItem: Text {
+                                text: updateNowButton.text
+                                color: "#0D1420"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 11
+                                font.weight: Font.DemiBold
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 8
+                                color: "#9FE0C0"
+                            }
                         }
                     }
                 }
