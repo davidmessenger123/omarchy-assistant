@@ -95,6 +95,8 @@ ShellRoot {
     property string recipeLoadBuffer: ""
     property string appLookupBuffer: ""
     property string recipePendingStep: ""
+    property var recipePendingClick: null
+    property int recipeLookupMessage: -1
     property int maxLooks: 3
     property string screenMonitor: "auto"
     property string settingsBuffer: ""
@@ -1017,6 +1019,58 @@ ShellRoot {
         var lastSaid = messages.count > 0 ? String(messages.get(messages.count - 1).text || "") : ""
         expect("a command step is not silently skipped", /not runnable yet/.test(lastSaid), true, lastSaid)
 
+        // Coordinates only count when they are fractions, and a refusal is never
+        // turned into a guess: a wrong click is the worst outcome in a recipe.
+        var good = root.recipeCoordinates("0.62, 0.31")
+        expect("a plain pair is read as a position", good !== null && Math.abs(good.x - 0.62) < 0.001 && Math.abs(good.y - 0.31) < 0.001, true, JSON.stringify(good))
+        expect("a bracketed pair works too", root.recipeCoordinates("(0.10, 0.90)") !== null, true)
+        expect("surrounding prose still works", root.recipeCoordinates("The box is at 0.5, 0.25 roughly") !== null, true)
+        expect("none is treated as not found", root.recipeCoordinates("none"), null)
+        expect("a refusal in words is not found", root.recipeCoordinates("I cannot see a search box on this screen"), null)
+        expect("percentages are refused, not clamped", root.recipeCoordinates("62%, 31%"), null)
+        expect("a value over one is refused", root.recipeCoordinates("1.4, 0.5"), null)
+        expect("a negative value is refused", root.recipeCoordinates("-0.2, 0.5"), null)
+        expect("a reply with no numbers is not found", root.recipeCoordinates("the screen is locked"), null)
+        expect("an empty reply is not found", root.recipeCoordinates(""), null)
+        expect("the very edge is allowed", root.recipeCoordinates("0, 0") !== null && root.recipeCoordinates("1, 1") !== null, true)
+
+        // A recipe click that cannot be located stops the recipe rather than
+        // proposing a click somewhere plausible.
+        root.recipeActive = true
+        root.recipeTitle = "locate"
+        root.recipeSteps = [{ click: "the search box" }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.recipePendingClick = { description: "the search box", where: "step 1 of 1" }
+        root.activeText = "none"
+        root.busy = true
+        var beforeLocate = messages.count
+        root.finishRecipeLocate()
+        expect("an unlocatable target stops the recipe", root.recipeActive, false)
+        expect("an unlocatable target says which target", messages.count > beforeLocate, true)
+        expect("an unlocatable target proposes no click", root.proposedAction, null)
+        expect("the lookup is not left pending", root.recipePendingClick, null)
+        expect("the lookup does not leave the app busy", root.busy, false)
+
+        // A located target proposes a click that still needs approval.
+        root.recipeActive = true
+        root.recipeTitle = "locate2"
+        root.recipeSteps = [{ click: "the search box" }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.proposedAction = null
+        root.pendingClick = null
+        root.recipePendingClick = { description: "the search box", where: "step 1 of 1" }
+        root.activeText = "0.62, 0.31"
+        root.busy = true
+        root.finishRecipeLocate()
+        expect("a located target proposes a click", root.proposedAction !== null && root.proposedAction.kind === "click", true, JSON.stringify(root.proposedAction))
+        expect("the proposed click keeps the position", root.proposedAction && Math.abs(root.proposedAction.x - 0.62) < 0.001, true)
+        expect("the proposed click names the target", root.proposedAction && root.proposedAction.target === "the search box", true)
+        expect("a located click still needs approval", Boolean(root.proposedAction && root.proposedAction.requiresApproval), true)
+        root.proposedAction = null
+        root.recipeFinish("selftest cleanup")
+
         // A second change in one turn is refused, and says so out loud.
         var before = messages.count
         root.refuseSecondChange()
@@ -1254,6 +1308,14 @@ ShellRoot {
             appLookup.running = true
             return
         }
+        if (action === "click") {
+            if (!String(value || "").trim()) {
+                root.recipeFail("the click step does not say what to click")
+                return
+            }
+            root.recipeLocate(String(value), where)
+            return
+        }
         if (action === "type") {
             if (!value || typeof value !== "object" || !String(value.text || "").trim()) {
                 root.recipeFail("the type step has no text")
@@ -1291,6 +1353,86 @@ ShellRoot {
             return
         }
         root.recipeFail("\"" + action + "\" steps are not runnable yet")
+    }
+
+    // A recipe cannot say where a button is, so the assistant is asked to look at a
+    // fresh screenshot and give the position back. It only ever proposes a click,
+    // which still has to be approved like any other.
+    function recipeLocate(description, where) {
+        if (root.recipePendingClick !== null) return
+        root.recipePendingClick = { description: String(description), where: String(where) }
+        // Its own message, or the coordinates land on top of whatever was said last.
+        root.recipeLookupMessage = addMessage("assistant", "")
+        root.activeMessage = root.recipeLookupMessage
+        root.activeText = ""
+        root.activePartId = ""
+        root.activeSources = []
+        root.activeFiles = []
+        root.errorText = ""
+        root.pendingPrompt = "The attached screenshot is the user's screen right now. Find one thing on it: " + String(description) + ". Reply with exactly two numbers between 0 and 1, separated by a comma, which are the x and y position of the centre of that target. If it is not visible, reply with the single word none. Reply with nothing else."
+        root.statusText = root.recipeTitle + ": looking for " + String(description)
+        assistant.visible = false
+        screenCaptureDelay.interval = 100
+        screenCaptureDelay.restart()
+    }
+
+    // Fractions only, and never clamped: a number outside 0 to 1 means the answer
+    // was not usable, and guessing a nearby spot would click the wrong thing.
+    function recipeCoordinates(text) {
+        var value = String(text || "")
+        if (/\bnone\b|not visible|cannot see|can't see|no such/i.test(value)) return null
+        var found = /(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)/.exec(value)
+        if (!found) return null
+        var x = parseFloat(found[1])
+        var y = parseFloat(found[2])
+        if (!isFinite(x) || !isFinite(y)) return null
+        if (x < 0 || x > 1 || y < 0 || y > 1) return null
+        return { x: x, y: y }
+    }
+
+    function finishRecipeLocate() {
+        var lookup = root.recipePendingClick
+        root.recipePendingClick = null
+        if (root.screenAttached) {
+            root.cleanupScreen()
+            root.screenAttached = false
+        }
+        if (!lookup || !root.recipeActive) {
+            root.busy = false
+            root.activePartId = ""
+            assistant.visible = true
+            Qt.callLater(function() { input.forceActiveFocus() })
+            return
+        }
+        var point = root.recipeCoordinates(root.activeText)
+        if (point === null) {
+            if (root.recipeLookupMessage >= 0) messages.setProperty(root.recipeLookupMessage, "text", "I could not find " + lookup.description + " on the screen.")
+            root.busy = false
+            root.activePartId = ""
+            root.recipeFail("I could not find " + lookup.description + " on the screen")
+            assistant.visible = true
+            Qt.callLater(function() { input.forceActiveFocus() })
+            return
+        }
+        var across = Math.round(point.x * 100)
+        var down = Math.round(point.y * 100)
+        if (root.recipeLookupMessage >= 0) messages.setProperty(root.recipeLookupMessage, "text", "Found " + lookup.description + " at " + across + "% across and " + down + "% down. Confirm the click below.")
+        root.logAction("look", "Looked for " + lookup.description, "found at " + across + "% across, " + down + "% down")
+        root.busy = false
+        root.activePartId = ""
+        root.recipePropose({
+            kind: "click",
+            x: point.x,
+            y: point.y,
+            target: lookup.description,
+            button: "left",
+            fromRecipe: true,
+            recipeStep: lookup.where,
+            requiresApproval: true,
+            risk: ""
+        })
+        assistant.visible = true
+        Qt.callLater(function() { input.forceActiveFocus() })
     }
 
     function recipePropose(action) {
@@ -1829,6 +1971,15 @@ ShellRoot {
             root.activeFiles = []
             root.errorText = ""
             if (root.continueAfterLook()) return
+        }
+        // The turn that answers a recipe's "where is this" question.
+        if (root.recipePendingClick !== null) {
+            if (exitCode === 0) root.finishRecipeLocate()
+            else {
+                root.recipePendingClick = null
+                root.recipeFail("looking at the screen failed")
+            }
+            return
         }
         // A window change resolves in a separate process, so its answer can arrive
         // after the model has finished. Wait for it, or the approval card is lost.

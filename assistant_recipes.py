@@ -242,7 +242,6 @@ SUPPORTED = {"say", "open", "click", "type", "press", "wait", "ask"}
 PENDING = {
     "command": "commands are not runnable yet",
     "wait_for": "waiting for text on screen is not implemented yet",
-    "click": "clicking a described target needs the assistant to look at the screen for it, which is not wired up yet"
 }
 
 

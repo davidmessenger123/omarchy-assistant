@@ -248,10 +248,17 @@ values filled in before you approve anything. While it runs:
 - **Anything unexpected stops the recipe** and says which step and why, rather
   than carrying on and hoping.
 
-Steps that run today: `say`, `open`, `type`, `press`, `wait`, `ask`. Steps that are
-accepted in a recipe but **refuse to run** until they are built: `click` (needs the
-assistant to look at the screen to turn a description into coordinates), `wait_for`
-(waiting for text to appear), and `command`. A recipe containing any of those is
+A `click` step names a target rather than a position, because a script cannot know
+where a button is. The assistant takes a fresh screenshot, asks itself where the
+target is, and proposes a click you still have to approve. It only accepts an answer
+that is a pair of fractions between 0 and 1: percentages, out-of-range numbers, "none",
+or anything it cannot read as a position all **stop the recipe** rather than being
+rounded into a click somewhere nearby. A wrong click is the one failure mode a recipe
+must not have.
+
+Steps that run today: `say`, `open`, `click`, `type`, `press`, `wait`, `ask`. Steps
+that are accepted in a recipe but **refuse to run** until they are built: `wait_for`
+(waiting for text to appear on screen) and `command`. A recipe containing either is
 refused up front, by name, rather than running part of the way and stopping.
 
 Two rules are enforced in the format rather than trusted to the draft. Commands run
