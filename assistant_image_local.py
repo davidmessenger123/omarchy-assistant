@@ -100,24 +100,48 @@ def weights_cached(model: str) -> bool:
 
 
 def runtime_report(model: str) -> dict:
-    report: dict = {"model": model, "weights_cached": weights_cached(model), "hf_home": str(HF_HOME)}
+    report: dict = {"model": model, "weights_cached": weights_cached(model), "hf_home": str(HF_HOME), "warnings": []}
     try:
         import torch  # noqa: PLC0415
     except Exception as error:  # pragma: no cover - depends on the environment
         report["torch"] = f"missing ({error})"
+        report["runtime"] = "none"
+        report["warnings"].append("PyTorch is not installed in the local image environment.")
         return report
+
     report["torch"] = torch.__version__
+    hip_version = getattr(torch.version, "hip", None)
+    cuda_version = getattr(torch.version, "cuda", None)
+    # A ROCm build reports hip and no cuda; both map onto torch.cuda.* APIs.
+    report["runtime"] = "hip" if hip_version else ("cuda" if cuda_version else "cpu")
+    if hip_version:
+        report["hip"] = hip_version
+    if cuda_version:
+        report["cuda"] = cuda_version
+
     try:
         if torch.cuda.is_available():
             properties = torch.cuda.get_device_properties(0)
             report["device"] = properties.name
             report["vram_gb"] = round(properties.total_memory / 1024**3, 1)
-            report["cuda"] = torch.version.cuda
+            if report["vram_gb"] and report["vram_gb"] < VRAM_OFFLOAD_THRESHOLD / 1024**3:
+                report["offload"] = "model-cpu-offload"
+                report["warnings"].append(
+                    f"Only {report['vram_gb']} GB of VRAM, so weights stream from system RAM during generation."
+                )
         else:
             report["device"] = "cpu"
             report["vram_gb"] = 0
     except Exception as error:  # pragma: no cover - defensive
         report["device"] = f"unknown ({error})"
+
+    if report["runtime"] == "cpu":
+        report["warnings"].append(
+            "This PyTorch build has no GPU runtime, so generation falls back to the CPU and is very slow. "
+            "On an AMD GPU install a ROCm build, on an NVIDIA GPU install a CUDA build."
+        )
+    if not report["weights_cached"]:
+        report["warnings"].append(f"Model weights for {model} are not downloaded yet.")
     return report
 
 
@@ -125,6 +149,8 @@ def load_pipeline(model: str):
     import torch  # noqa: PLC0415
     from diffusers import DiffusionPipeline  # noqa: PLC0415
 
+    # ROCm builds report hip here and still expose the torch.cuda API.
+    backend = "hip" if getattr(torch.version, "hip", None) else "cuda"
     if not torch.cuda.is_available():
         return DiffusionPipeline.from_pretrained(
             model, torch_dtype=torch.float32, use_safetensors=True
@@ -140,9 +166,9 @@ def load_pipeline(model: str):
     if total_vram and total_vram < VRAM_OFFLOAD_THRESHOLD:
         # Keep the bulk of the weights in system RAM so a 6 GB card still works.
         pipeline.enable_model_cpu_offload()
-        return pipeline, "cuda-offload"
+        return pipeline, f"{backend}-offload"
     pipeline.to("cuda")
-    return pipeline, "cuda"
+    return pipeline, backend
 
 
 def state_dir() -> Path:
@@ -198,7 +224,11 @@ def generate(request: dict) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     if not torch.cuda.is_available():
-        fail("The local image backend needs a CUDA GPU, and none is available to PyTorch.")
+        backend = "ROCm" if getattr(torch.version, "hip", None) else "CUDA"
+        fail(
+            f"The local image backend needs a {backend}-enabled PyTorch build, and this one reports no GPU. "
+            "Reinstall it with bin/assistant-config setup-image-models, or use the gemini backend instead."
+        )
         return
 
     started = time.monotonic()

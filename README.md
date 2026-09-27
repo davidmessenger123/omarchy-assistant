@@ -31,6 +31,14 @@ cd omarchy-assistant
 
 `install.sh` installs the project-local OpenCode tool dependency and prints the exact Hyprland binding to add. It does not modify Hyprland configuration automatically.
 
+To install the local image model in the same step (about 13 GB, so it is opt-in and never happens by accident):
+
+```bash
+./install.sh --with-image-model
+```
+
+`install.sh --help` lists the options, including `--image-model-args "--rocm 6.4"` to pin a ROCm index and `--yes` to skip the confirmation prompt.
+
 Add this to `~/.config/hypr/bindings.lua`, using the clone path printed by the installer:
 
 ```lua
@@ -67,14 +75,24 @@ The key is stored at `~/.config/omarchy-assistant/gemini.key` with mode `600`, i
 
 ### Local backend
 
-Runs SDXL-Turbo on the NVIDIA GPU through a private virtual environment, so nothing is installed system-wide:
+Runs SDXL-Turbo on the GPU through a private virtual environment, so nothing is installed system-wide:
 
 ```bash
 ./bin/assistant-config setup-image-models   # venv, PyTorch, diffusers, then the weights
-./bin/assistant-config image-status          # GPU, torch, and cached-weight report
+./bin/assistant-config image-status         # GPU vendor, runtime, and cached-weight report
+./bin/assistant-config image-setup-plan     # what would be installed, without installing
 ```
 
-The first command creates `~/.local/share/omarchy-assistant/image-venv`, installs PyTorch and diffusers, and downloads the SDXL-Turbo weights (about 7 GB). SDXL-Turbo needs about 5 GB of VRAM; smaller cards work because the weights stream from system RAM, and the helper automatically stays on the CPU when no CUDA GPU is visible.
+The first command creates `~/.local/share/omarchy-assistant/image-venv`, installs PyTorch and diffusers, and downloads the SDXL-Turbo weights (about 7 GB). SDXL-Turbo needs about 5 GB of VRAM; smaller cards work because the weights stream from system RAM, and the helper automatically stays on the CPU when no supported GPU is visible.
+
+The setup command detects the GPU vendor and installs a matching PyTorch build: CUDA wheels from PyPI on NVIDIA, and ROCm wheels from `download.pytorch.org` on AMD. Check what it will do with `image-setup-plan` before installing, and override the detection when needed:
+
+```bash
+./bin/assistant-config setup-image-models --backend amd --rocm 6.4
+./bin/assistant-config setup-image-models --rebuild-torch   # replace an existing PyTorch
+```
+
+`ASSISTANT_IMAGE_TORCH_BACKEND` (`nvidia`, `amd`, `intel`, `none`) and `ASSISTANT_ROCM_VERSION` do the same from the environment.
 
 Measured on an RTX A3000 Laptop GPU with 6 GB of VRAM, using model offload:
 
@@ -87,6 +105,17 @@ Measured on an RTX A3000 Laptop GPU with 6 GB of VRAM, using model offload:
 
 Each request also pays a one-off ~5 s model load, so a single image takes roughly 13-16 s end to end. Extra steps barely change the time, because streaming the weights dominates on a card this size. Quality is good for drafts, stylised art, and private subjects, and noticeably weaker than Gemini for photorealism, precise composition, and text inside the image. Use `local` for drafts, iterations, private subjects, and offline work; switch to `gemini` for the final image.
 
+#### AMD GPUs (ROCm)
+
+Local generation works on AMD cards that ROCm supports, and the helper detects the HIP runtime the same way it detects CUDA:
+
+- Supported: Radeon RX 9000 (RDNA 4), Radeon RX 7000 and PRO W7000 (RDNA 3), Radeon PRO V (RDNA 2), and Ryzen AI 300/400 APUs. Older GCN and Vega cards are not supported by current ROCm.
+- Install ROCm itself first. On Arch: `sudo pacman -S rocm rocm-hip rocm-smi-lib`. AMD officially supports Ubuntu, RHEL, and Windows, so other distributions may need extra work, and some Arch setups need `HSA_OVERRIDE_GFX_VERSION`.
+- Then run `./bin/assistant-config setup-image-models`. It picks a ROCm PyTorch wheel index automatically, using the installed ROCm version when it can, and falls back to 6.4 otherwise.
+- `image-status` reports `runtime=hip` with the HIP version, the device name, and the VRAM. If it reports `runtime=cpu`, the installed PyTorch has no GPU support, so rebuild it with `--rebuild-torch`.
+
+Intel GPUs have no supported PyTorch path for this model here, so `setup-image-models` warns and local generation falls back to the CPU, which is very slow. Use the Gemini backend on Intel machines.
+
 ### Notes
 
 - Every Gemini image is a billable API call, and the prompt is sent to Google. Never include secrets or private data in a Gemini image prompt.
@@ -96,6 +125,21 @@ Each request also pays a one-off ~5 s model load, so a single image takes roughl
 ## Updates
 
 The **Update** button checks the current `origin` branch on GitHub without changing the checkout. If the branch is behind and the working tree is clean, **Update now** performs a fast-forward pull, refreshes the project-local OpenCode dependency, and restarts the assistant. Local uncommitted changes block applying an update; commit or stash them first.
+
+Updates never download image models or the virtual environment, so an existing machine keeps its weights and never re-pulls 13 GB. To add the model to a machine that does not have it yet, run `bin/assistant-config setup-image-models` once.
+
+### Troubleshooting
+
+`bash: ./bin/assistant-config: No such file or directory` means the checkout on that machine predates the image-generation commits, or you are not in the repository root. Check with:
+
+```bash
+cd <path-to-omarchy-assistant>
+git log --oneline -1      # want 54f81f3 or newer
+git status --short        # any output means a dirty tree, which blocks Update
+ls bin/                   # want assistant-config listed
+```
+
+If the tree is dirty, `git stash` or commit the changes, then click **Update** again or run `git pull --ff-only`.
 
 ## Memory
 

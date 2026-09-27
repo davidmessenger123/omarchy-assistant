@@ -56,11 +56,86 @@ image_python() {
     printf '%s\n' "${ASSISTANT_IMAGE_PYTHON:-$(image_venv)/bin/python}"
 }
 
+# Which GPU vendor is present? Prints nvidia, amd, intel, or none.
+detect_gpu_vendor() {
+    local override="${ASSISTANT_IMAGE_TORCH_BACKEND:-}"
+    case "$override" in
+        nvidia | amd | intel | none) printf '%s\n' "$override"; return ;;
+        "") ;;
+        *) printf '%s\n' "$override"; return ;;
+    esac
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        printf 'nvidia\n'
+        return
+    fi
+    if command -v rocminfo >/dev/null 2>&1 && rocminfo >/dev/null 2>&1; then
+        printf 'amd\n'
+        return
+    fi
+    local vendor
+    vendor="$(lspci 2>/dev/null | rg -i 'vga compatible controller|3d controller|display controller' | rg -io 'nvidia|amd|ati|intel' | head -n 1 || true)"
+    case "$vendor" in
+        nvidia) printf 'nvidia\n' ;;
+        amd | ati) printf 'amd\n' ;;
+        intel) printf 'intel\n' ;;
+        *) printf 'none\n' ;;
+    esac
+}
+
+detect_rocm_version() {
+    if [[ -n "${ASSISTANT_ROCM_VERSION:-}" ]]; then
+        printf '%s\n' "${ASSISTANT_ROCM_VERSION#rocm}"
+        return
+    fi
+    local version=""
+    if [[ -r /opt/rocm/.info/version ]]; then
+        version="$(cut -d- -f1 /opt/rocm/.info/version | tr -dc '0-9.')"
+    fi
+    if [[ -z "$version" ]] && command -v rocminfo >/dev/null 2>&1; then
+        version="$(rocminfo 2>/dev/null | rg -o 'ROCm version: [0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | rg -o '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+    fi
+    # Only indexes that publish PyTorch builds are usable.
+    case "${version%.*}" in
+        6.2 | 6.3 | 6.4 | 7.0 | 7.1) printf '%s\n' "${version%.*}" ;;
+        *) printf '6.4\n' ;;
+    esac
+}
+
+image_setup_plan() {
+    local vendor rocm
+    vendor="$(detect_gpu_vendor)"
+    rocm="$(detect_rocm_version)"
+    printf 'gpu_vendor=%s\n' "$vendor"
+    printf 'python=%s\n' "$(image_python)"
+    printf 'helper=%s\n' "$image_helper"
+    printf 'model=%s\n' "${ASSISTANT_IMAGE_LOCAL_MODEL:-stabilityai/sdxl-turbo}"
+    case "$vendor" in
+        amd)
+            printf 'torch_index=https://download.pytorch.org/whl/rocm%s\n' "$rocm"
+            printf 'rocm_detected=%s\n' "$rocm"
+            if ! command -v rocminfo >/dev/null 2>&1; then
+                printf 'rocm_installed=no\n'
+                printf 'note=Install ROCm first (Arch: pacman -S rocm rocm-hip; see https://rocm.docs.amd.com for other distributions), then re-run this command.\n'
+            else
+                printf 'rocm_installed=yes\n'
+            fi
+            ;;
+        intel)
+            printf 'torch_index=default\n'
+            printf 'note=Intel GPUs have no supported PyTorch SDXL path here; generation will fall back to the CPU. Use the gemini backend or an NVIDIA/AMD machine for local generation.\n'
+            ;;
+        *)
+            printf 'torch_index=default\n'
+            ;;
+    esac
+}
+
 image_status() {
     local python_bin model
     python_bin="$(image_python)"
     model="${ASSISTANT_IMAGE_LOCAL_MODEL:-stabilityai/sdxl-turbo}"
     printf 'local_python=%s\n' "$python_bin"
+    printf 'gpu_vendor=%s\n' "$(detect_gpu_vendor)"
     if [[ ! -x "$python_bin" ]]; then
         printf 'local_installed=no\n'
         printf 'next_step=run bin/assistant-config setup-image-models\n'
@@ -72,16 +147,43 @@ image_status() {
 }
 
 setup_image_models() {
-    local prefetch=1 venv python_bin
-    for argument in "$@"; do
-        case "$argument" in
-            --no-prefetch) prefetch=0 ;;
-            *) printf 'Unknown option: %s\n' "$argument" >&2; exit 1 ;;
+    local prefetch=1 venv python_bin vendor rocm torch_args=() rebuild_torch=0
+    while (($# > 0)); do
+        case "$1" in
+            --no-prefetch)
+                prefetch=0
+                ;;
+            --rebuild-torch)
+                rebuild_torch=1
+                ;;
+            --rocm)
+                shift
+                ASSISTANT_ROCM_VERSION="${1:-}"
+                if [[ -z "$ASSISTANT_ROCM_VERSION" ]]; then
+                    printf -- '--rocm needs a version, for example --rocm 6.4\n' >&2
+                    exit 1
+                fi
+                ;;
+            --backend)
+                shift
+                ASSISTANT_IMAGE_TORCH_BACKEND="${1:-}"
+                if [[ -z "$ASSISTANT_IMAGE_TORCH_BACKEND" ]]; then
+                    printf -- '--backend needs a vendor: nvidia, amd, intel, or none\n' >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                printf 'Unknown option: %s\n' "$1" >&2
+                exit 1
+                ;;
         esac
+        shift
     done
     venv="$(image_venv)"
     python_bin="$(image_python)"
     helper="$image_helper"
+    vendor="$(detect_gpu_vendor)"
+    rocm="$(detect_rocm_version)"
     if [[ ! -x "$python_bin" ]]; then
         printf 'Creating the local image environment in %s\n' "$venv"
         mkdir -p "$(dirname "$venv")"
@@ -90,9 +192,39 @@ setup_image_models() {
             exit 1
         }
     fi
-    printf 'Installing PyTorch and diffusers into %s\n' "$venv"
     "$python_bin" -m pip install --upgrade pip >/dev/null
-    "$python_bin" -m pip install --upgrade torch diffusers transformers accelerate safetensors sentencepiece protobuf pillow || {
+
+    if [[ "$vendor" == "amd" ]]; then
+        if ((rebuild_torch == 0)) && "$python_bin" -c 'import torch, sys; sys.exit(0 if getattr(torch.version, "hip", None) else 1)' 2>/dev/null; then
+            printf 'PyTorch already has a ROCm build; keeping it.\n'
+        else
+            printf 'Installing a ROCm %s PyTorch build for the AMD GPU.\n' "$rocm"
+            if ! command -v rocminfo >/dev/null 2>&1; then
+                printf 'Warning: rocminfo was not found. Install ROCm before generating, or PyTorch will not see the GPU.\n' >&2
+                printf '  Arch: sudo pacman -S rocm rocm-hip rocm-smi-lib\n' >&2
+                printf '  Others: see https://rocm.docs.amd.com/projects/radeon/en/latest/docs/install.html\n' >&2
+            fi
+            "$python_bin" -m pip install --upgrade --force-reinstall torch --index-url "https://download.pytorch.org/whl/rocm$rocm" || {
+                printf 'ROCm PyTorch installation failed. Try: --rocm %s\n' "$rocm" >&2
+                exit 1
+            }
+        fi
+    else
+        if [[ "$vendor" == "nvidia" ]]; then
+            printf 'Installing a CUDA PyTorch build for the NVIDIA GPU.\n'
+        elif [[ "$vendor" == "intel" ]]; then
+            printf 'Warning: no supported local GPU runtime for Intel graphics; generation will use the CPU.\n' >&2
+        else
+            printf 'No supported GPU detected; installing the default PyTorch build (CPU fallback).\n'
+        fi
+        "$python_bin" -m pip install --upgrade torch || {
+            printf 'PyTorch installation failed.\n' >&2
+            exit 1
+        }
+    fi
+
+    printf 'Installing diffusers and friends into %s\n' "$venv"
+    "$python_bin" -m pip install --upgrade diffusers transformers accelerate safetensors sentencepiece protobuf pillow || {
         printf 'Dependency installation failed.\n' >&2
         exit 1
     }
@@ -133,8 +265,18 @@ Usage: assistant-config <command>
   set-key --from-env    Store the value of GEMINI_API_KEY from the environment
   clear                 Delete the stored Gemini API key
   output-dir            Print the directory where generated images are saved
-  image-status          Report local backend, GPU, and cached weight status
+  image-status          Report local backend, GPU vendor, runtime, and cached weights
+  image-setup-plan      Show which PyTorch build setup would install, without installing
   setup-image-models    Install the local backend (venv, PyTorch, SDXL-Turbo weights)
+
+Options for setup-image-models:
+  --no-prefetch         Install everything but skip the multi-GB weight download
+  --backend VENDOR      Force nvidia, amd, intel, or none instead of detecting
+  --rocm VERSION        Use a specific ROCm wheel index, for example 6.4
+  --rebuild-torch       Reinstall PyTorch even if a matching build is present
+
+Environment overrides: ASSISTANT_IMAGE_TORCH_BACKEND, ASSISTANT_ROCM_VERSION,
+ASSISTANT_IMAGE_VENV, ASSISTANT_IMAGE_PYTHON, ASSISTANT_IMAGE_LOCAL_MODEL.
 EOF
 }
 
@@ -170,6 +312,9 @@ case "${1:-status}" in
         ;;
     image-status)
         image_status
+        ;;
+    image-setup-plan)
+        image_setup_plan
         ;;
     setup-image-models)
         shift || true
