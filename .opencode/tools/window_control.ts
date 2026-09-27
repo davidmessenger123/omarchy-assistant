@@ -30,7 +30,7 @@ async function listWindows() {
 }
 
 export default tool({
-    description: "Control the user's windows and workspaces in Hyprland. Use it for requests like 'what's open right now', 'focus the browser', 'move Teams to the big monitor', 'put these two windows side by side', 'switch to workspace 3', 'fullscreen this', or 'send it to the scratchpad'. Listing windows only reads state and answers straight away; every change is proposed to the user for approval first. There is deliberately no way to close or kill a window through this tool, so ask the user to do that themselves.",
+    description: "Control the user's windows and workspaces in Hyprland. Use it for requests like 'what's open right now', 'focus the browser', 'move Teams to the big monitor', 'put these two windows side by side', 'switch to workspace 3', 'fullscreen this', or 'send it to the scratchpad'. Listing windows only reads state and answers straight away. Every change is only a request: the desktop app shows the user a card, nothing moves until they approve it, and you get no result telling you it happened. So never write that a window has been moved, resized, tiled, focused, or is done, and never say 'Done'. Say instead that you have asked for it and it is waiting for approval. There is deliberately no way to close or kill a window through this tool, so ask the user to do that themselves.",
     args: {
         op: tool.schema.string().describe("One of: list, focus, move, swap, resize, float, fullscreen, workspace, monitor, scratchpad, tile."),
         target: tool.schema.string().describe("Which window: a class such as foot, a piece of its title, or an address such as 0x55e0ed736b60. Leave empty for list, workspace, monitor, and a bare scratchpad toggle."),
@@ -67,7 +67,9 @@ export default tool({
                 op,
                 target: names.join(","),
                 direction: String(args.direction || "left").trim().toLowerCase() === "right" ? "right" : "left",
-                detail: "floats them and places them in equal columns; the user can unfloat afterwards"
+                detail: "floats them and places them in equal columns; the user can unfloat afterwards",
+                applied: false,
+                state: "waiting_for_approval"
             })
         }
         if (op === "swap" && (!target || !other)) {
@@ -101,7 +103,10 @@ export default tool({
             other,
             width: Number(args.width) || 0,
             height: Number(args.height) || 0,
-            direction: String(args.direction || "left").trim().toLowerCase() === "right" ? "right" : "left"
+            direction: String(args.direction || "left").trim().toLowerCase() === "right" ? "right" : "left",
+            applied: false,
+            state: "waiting_for_approval",
+            note: "Requested only. The user must approve the card before anything changes, and nothing in this result says it happened."
         })
     }
 })

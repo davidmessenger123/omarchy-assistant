@@ -160,6 +160,14 @@ address. If a name matches more than one window the assistant is told the candid
 and asks you which one you meant rather than guessing. Destinations accept a
 workspace number or name, or `monitor:left`, `monitor:right`, and a monitor name.
 
+### One change per turn, and nothing happens until you approve
+
+The assistant makes **one** window change per turn, the same rule clicks and typing
+follow. Ask for two things at once and it does the first, then asks whether to go
+on with the second. It never says a window has moved: a change it proposes is only
+a request, the card waits for you, and the status line reads "Waiting for your
+approval" until you accept or decline.
+
 Two deliberate limits. There is **no way to close or kill a window**, so a runaway
 window still needs your own hands. And `tile` **floats** the windows it places,
 because Hyprland's tiling layout will not honour exact coordinates for a tiled
@@ -182,6 +190,17 @@ left alone.
 - A monitor name such as `DP-7` pins it to that output.
 
 The chosen monitor is written next to the capture as a `.monitor` sidecar, which is also how synthetic clicks are mapped back to the right screen. On multi-monitor setups the other outputs are briefly disabled during the capture to avoid a Hyprland screencopy stall, then restored.
+
+### Checking the parts that only exist in the running app
+
+Most behaviour is covered by the test harnesses, but the hand-off between a finished
+model turn and a window plan resolving in a separate process only exists while the
+app is running. That ordering had a bug that no headless test could see, so the app
+can check itself:
+
+```bash
+ASSISTANT_SELFTEST=1 quickshell --path ./shell.qml   # prints SELFTEST PASS/FAIL, then exits
+```
 
 ## Checking an installation
 

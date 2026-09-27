@@ -26,6 +26,12 @@ ShellRoot {
     property var pendingClick: null
     property var proposedAction: null
     property var windowProposal: null
+    property bool requestFinished: false
+    property int requestExitCode: 0
+    // ASSISTANT_SELFTEST=1 exercises the action hand-off and exits. The ordering
+    // between a finished model turn and a window plan resolving in another
+    // process is invisible to the headless tests, so it is checked here.
+    property bool selfTest: Quickshell.env("ASSISTANT_SELFTEST") === "1"
     // The only commands the model can ask for. A name that is not in here is
     // refused, so no command text ever reaches the shell from a tool.
     readonly property var notificationCommands: ({ "dismiss_notifications": ["dismiss"] })
@@ -823,12 +829,55 @@ ShellRoot {
         root.statusText = "Action proposed"
     }
 
+    // The model cannot see a refusal from here, so the transcript has to say it.
+    // Otherwise the user is left with a claim that the change was made.
+    function runSelfTest() {
+        var results = []
+        function expect(name, actual, wanted) {
+            results.push((actual === wanted ? "PASS " : "FAIL ") + name + " (got " + actual + ", wanted " + wanted + ")")
+        }
+
+        // A window plan resolving after the model finished must not be lost.
+        root.proposedAction = null
+        root.pendingClick = null
+        root.requestFinished = false
+        root.windowProposal = { op: "focus", target: "selftest" }
+        root.finishRequest(0)
+        expect("a turn waits for a window plan in flight", root.requestFinished, true)
+        expect("nothing is shown while the plan is in flight", root.pendingClick === null, true)
+
+        root.windowProposal = null
+        root.proposedAction = { kind: "window", op: "focus", summary: "selftest change", requiresApproval: true, risk: "low" }
+        root.completeRequest(0)
+        expect("the deferred turn still shows the card", root.pendingClick !== null, true)
+        expect("the card keeps the change for approval", root.pendingClick && root.pendingClick.summary === "selftest change", true)
+        expect("a window change is never auto-run", root.pendingClick && root.pendingClick.requiresApproval === true, true)
+
+        // A second change in one turn is refused, and says so out loud.
+        var before = messages.count
+        root.refuseSecondChange()
+        expect("a second change is refused", messages.count === before + 1, true)
+
+        // Without an in-flight plan the turn finishes immediately.
+        root.pendingClick = null
+        root.requestFinished = false
+        root.finishRequest(0)
+        expect("a turn with no plan in flight does not defer", root.requestFinished, false)
+
+        console.log("SELFTEST " + results.join(" | "))
+        Qt.quit()
+    }
+
+    function refuseSecondChange() {
+        root.errorText = "Only one change per turn."
+        addMessage("assistant", "I only make one change per turn, so I did not apply that second one. Ask me again once this one is done and I will do it next.")
+    }
+
     function planWindow(proposal) {
-        if (root.proposedAction !== null || root.pendingClick !== null) {
-            root.errorText = "Only one computer action is allowed per turn."
+        if (root.proposedAction !== null || root.pendingClick !== null || windowPlan.running || root.windowProposal !== null) {
+            root.refuseSecondChange()
             return
         }
-        if (windowPlan.running) return
         root.windowProposal = {
             op: String(proposal.op || ""),
             target: String(proposal.target || ""),
@@ -866,6 +915,7 @@ ShellRoot {
             addMessage("assistant", "I could not do that: " + message)
             root.windowProposal = null
             if (root.autonomyActive) root.stopAutonomy("Window not found")
+            if (root.requestFinished) root.completeRequest(root.requestExitCode)
             return
         }
         if (plan.query === true || plan.op === "list") {
@@ -882,13 +932,20 @@ ShellRoot {
             requiresApproval: true,
             risk: ""
         }
-        if (root.proposedAction !== null) {
-            root.errorText = "Only one computer action is allowed per turn."
+        if (root.proposedAction !== null || root.pendingClick !== null) {
             root.windowProposal = null
+            root.refuseSecondChange()
             return
         }
         root.proposedAction = root.classifyActionRisk(action)
-        root.statusText = "Action proposed"
+        if (root.requestFinished) {
+            // The turn already ended while this plan was resolving. Finish it now,
+            // or the proposal is set but never shown and the change silently
+            // never happens.
+            root.completeRequest(root.requestExitCode)
+        } else {
+            root.statusText = "Action proposed"
+        }
     }
 
     function finishWindowRun(exitCode) {
@@ -993,6 +1050,7 @@ ShellRoot {
         root.autonomyActive = false
         root.autonomyStep = 0
         root.autonomyFeedback = ""
+        root.requestFinished = false
         if (message) root.statusText = message
         if (wasActive) root.logAction("task", "Guarded task finished", message || "completed")
         if (root.screenAttached) {
@@ -1303,6 +1361,18 @@ ShellRoot {
             root.errorText = ""
             if (root.continueAfterLook()) return
         }
+        // A window change resolves in a separate process, so its answer can arrive
+        // after the model has finished. Wait for it, or the approval card is lost.
+        if (windowPlan.running || root.windowProposal !== null) {
+            root.requestFinished = true
+            root.requestExitCode = exitCode
+            return
+        }
+        root.completeRequest(exitCode)
+    }
+
+    function completeRequest(exitCode) {
+        root.requestFinished = false
         var action = root.proposedAction
         root.proposedAction = null
         if (exitCode !== 0) {
@@ -1328,7 +1398,7 @@ ShellRoot {
                 return
             }
             root.pendingClick = action
-            root.statusText = action.risk === "high" ? "Confirmation required" : "Action proposed"
+            root.statusText = action.risk === "high" ? "Confirmation required" : action.requiresApproval ? "Waiting for your approval" : "Action proposed"
         } else {
             if (root.activeMessage >= 0 && root.activeText.trim() === "") {
                 messages.setProperty(root.activeMessage, "text", "I did not receive an answer.")
@@ -1464,6 +1534,7 @@ ShellRoot {
         root.logAction("task", "Started a guarded task", String(prompt).slice(0, 120))
         root.autonomyStep = 0
         root.autonomyFeedback = ""
+        root.requestFinished = false
         root.approvedTargets = []
         root.looksUsed = 0
         input.text = ""
@@ -1629,6 +1700,14 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Timer {
+        id: selfTestTimer
+        interval: 500
+        running: root.selfTest
+        repeat: false
+        onTriggered: root.runSelfTest()
     }
 
     Process {
