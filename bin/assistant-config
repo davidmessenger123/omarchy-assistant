@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Manage Omarchy Assistant image generation settings.
+set -euo pipefail
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-assistant"
+key_file="$config_dir/gemini.key"
+
+pictures_root() {
+    if [[ -n "${XDG_PICTURES_DIR:-}" ]]; then
+        printf '%s\n' "${XDG_PICTURES_DIR/#\$HOME/$HOME}"
+        return
+    fi
+    if [[ -r "$HOME/.config/user-dirs.dirs" ]]; then
+        local value
+        value="$(sed -n 's/^XDG_PICTURES_DIR="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$HOME/.config/user-dirs.dirs" | head -n 1)"
+        if [[ -n "$value" ]]; then
+            printf '%s\n' "${value/#\$HOME/$HOME}"
+            return
+        fi
+    fi
+    printf '%s\n' "$HOME/Pictures"
+}
+
+output_dir() {
+    if [[ -n "${ASSISTANT_IMAGE_DIR:-}" ]]; then
+        printf '%s\n' "${ASSISTANT_IMAGE_DIR/#\$HOME/$HOME}"
+        return
+    fi
+    printf '%s\n' "$(pictures_root)/omarchy-assistant"
+}
+
+store_key() {
+    local value="$1"
+    if ((${#value} < 20)); then
+        printf 'That key looks too short; expected a Gemini API key of at least 20 characters.\n' >&2
+        return 1
+    fi
+    if [[ "$value" == *$'\n'* || "$value" =~ [[:space:]] ]]; then
+        printf 'The key must be a single token with no spaces.\n' >&2
+        return 1
+    fi
+    umask 077
+    mkdir -p "$config_dir"
+    printf '%s\n' "$value" > "$key_file"
+    chmod 600 "$key_file"
+    printf 'Saved Gemini API key to %s (mode 600).\n' "$key_file"
+}
+
+status() {
+    local source="none"
+    if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+        source="GEMINI_API_KEY environment variable"
+    elif [[ -r "$key_file" && -s "$key_file" ]]; then
+        source="$key_file"
+    fi
+    printf 'configured=%s\n' "$([[ "$source" == "none" ]] && printf 'no' || printf 'yes')"
+    printf 'source=%s\n' "$source"
+    printf 'model=%s\n' "${ASSISTANT_IMAGE_MODEL:-gemini-3-pro-image}"
+    printf 'output_dir=%s\n' "$(output_dir)"
+    printf 'hourly_limit=%s\n' "${ASSISTANT_IMAGE_HOURLY_LIMIT:-10}"
+    printf 'daily_limit=%s\n' "${ASSISTANT_IMAGE_DAILY_LIMIT:-60}"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: assistant-config <command>
+
+  status              Show whether image generation is configured (never prints the key)
+  set-key             Read a Gemini API key from stdin and store it with mode 600
+  set-key --from-env  Store the value of GEMINI_API_KEY from the environment
+  clear               Delete the stored Gemini API key
+  output-dir          Print the directory where generated images are saved
+EOF
+}
+
+case "${1:-status}" in
+    status)
+        status
+        ;;
+    set-key)
+        if [[ "${2:-}" == "--from-env" ]]; then
+            if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+                printf 'GEMINI_API_KEY is not set in this shell.\n' >&2
+                exit 1
+            fi
+            store_key "$GEMINI_API_KEY"
+        else
+            if [[ -t 0 ]]; then
+                printf 'Paste the Gemini API key, then press enter: ' >&2
+            fi
+            IFS= read -r key
+            store_key "$key"
+        fi
+        ;;
+    clear)
+        if [[ -e "$key_file" ]]; then
+            rm -f "$key_file"
+            printf 'Removed %s\n' "$key_file"
+        else
+            printf 'No stored key at %s\n' "$key_file"
+        fi
+        ;;
+    output-dir)
+        output_dir
+        ;;
+    help | -h | --help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+esac

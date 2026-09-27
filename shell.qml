@@ -195,6 +195,10 @@ ShellRoot {
         return parts.length > 0 && parts[parts.length - 1] ? parts[parts.length - 1] : text
     }
 
+    function isImagePath(value) {
+        return /\.(png|jpe?g|webp|gif|bmp)$/i.test(String(value || ""))
+    }
+
     function openFile(value) {
         var path = root.fileCandidate(value, true)
         if (!path) return
@@ -684,6 +688,8 @@ ShellRoot {
             } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type") {
                 root.statusText = tool === "open_application" ? "Preparing application" : "Preparing action"
                 if (event.part.state) root.parseActionProposal(event.part.state.output)
+            } else if (tool === "generate_image") {
+                root.statusText = "Creating image"
             } else if (tool === "memory") {
                 root.statusText = "Updating memory"
             } else if (tool === "read") {
@@ -1400,16 +1406,39 @@ ShellRoot {
                                         delegate: Rectangle {
                                             id: fileDelegate
                                             required property string modelData
+                                            readonly property bool image: root.isImagePath(fileDelegate.modelData)
                                             width: fileColumn.width
-                                            height: 44
+                                            height: image ? 200 : 44
                                             radius: 10
                                             color: "#1A3040"
                                             border.width: 1
                                             border.color: "#31536A"
+                                            clip: true
+
+                                            Rectangle {
+                                                visible: fileDelegate.image
+                                                x: 10
+                                                y: 6
+                                                width: parent.width - 20
+                                                height: 148
+                                                radius: 8
+                                                color: "#0D141C"
+                                                clip: true
+
+                                                Image {
+                                                    anchors.fill: parent
+                                                    anchors.margins: 1
+                                                    source: fileDelegate.image ? "file://" + fileDelegate.modelData : ""
+                                                    fillMode: Image.PreserveAspectFit
+                                                    asynchronous: true
+                                                    cache: true
+                                                    smooth: true
+                                                }
+                                            }
 
                                             Text {
                                                 x: 10
-                                                y: 5
+                                                y: fileDelegate.image ? 160 : 5
                                                 width: parent.width - 20
                                                 text: "Open  " + root.fileLabel(fileDelegate.modelData)
                                                 color: "#DCF3E7"
@@ -1421,7 +1450,7 @@ ShellRoot {
 
                                             Text {
                                                 x: 10
-                                                y: 24
+                                                y: fileDelegate.image ? 179 : 24
                                                 width: parent.width - 20
                                                 text: fileDelegate.modelData
                                                 color: "#8BB7C9"

@@ -8,6 +8,7 @@ A Quickshell desktop assistant for Omarchy/Hyprland. It uses OpenCode as its mod
 - iterative autonomous tasks that re-capture the screen after each action
 - first-use approval for each click/typing target, plus confirmation for sensitive actions
 - local memory for preferences, instructions, project context, personal facts, and conversation summaries
+- image generation through a dedicated Gemini image tool, with inline preview and one-click opening
 
 The assistant never edits files or runs arbitrary shell commands. Computer actions are executed by the local QML process only after the model proposes them and the safety checks pass.
 
@@ -41,6 +42,26 @@ o.bind("SUPER + SHIFT + Q", "Omarchy Assistant", {
 Reload Hyprland, then launch with `run.sh` or the binding.
 
 For synthetic clicking, ensure the user can access `/dev/uinput` using the system's udev/ACL policy. The assistant refuses to silently fall back to unrestricted input.
+
+## Image generation
+
+The chat model (Space Bunny) cannot create images, so the Assistant calls a dedicated `generate_image` tool that uses Google's Gemini image model (`gemini-3-pro-image`, Nano Banana Pro). Ask for an image in plain language, for example "draw a watercolour of a lighthouse at dusk in 16:9". The Assistant picks the aspect ratio, saves the file under `~/Pictures/omarchy-assistant/`, and shows the image inline with an **Open** button. This version generates new images only; it cannot edit an existing image.
+
+Image generation needs your own Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey):
+
+```bash
+# once per machine
+printf '%s' 'your-gemini-api-key' | ./bin/assistant-config set-key
+./bin/assistant-config status
+```
+
+The key is stored at `~/.config/omarchy-assistant/gemini.key` with mode `600`, is never written to the repository, and is never printed back. `GEMINI_API_KEY` in the environment works too and takes precedence. Use `./bin/assistant-config clear` to remove the stored key.
+
+Notes:
+
+- Every image is a billable Gemini API call, and the prompt is sent to Google. Never include secrets or private data in an image prompt.
+- Generation is rate limited to 10 images per hour and 60 per day by default. Override with `ASSISTANT_IMAGE_HOURLY_LIMIT` and `ASSISTANT_IMAGE_DAILY_LIMIT`.
+- `ASSISTANT_IMAGE_MODEL`, `ASSISTANT_GEMINI_ENDPOINT`, `ASSISTANT_IMAGE_DIR`, and `ASSISTANT_IMAGE_TIMEOUT_MS` are available for advanced setups, such as an API-compatible proxy or a different Gemini model.
 
 ## Updates
 
