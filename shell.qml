@@ -938,6 +938,26 @@ ShellRoot {
         WlrLayershell.layer: WlrLayer.Overlay
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
 
+        Shortcut {
+            sequence: "Escape"
+            enabled: assistant.visible
+            onActivated: root.closeAssistant()
+        }
+
+        Shortcut {
+            sequence: "Ctrl+."
+            enabled: assistant.visible
+            onActivated: {
+                if (root.autonomyActive || root.clickBusy) root.stopAutonomy("Autonomous task stopped")
+            }
+        }
+
+        Shortcut {
+            sequence: "Ctrl+L"
+            enabled: assistant.visible
+            onActivated: root.newChat()
+        }
+
         Rectangle {
             anchors.fill: parent
             color: "#B8000B12"
@@ -1473,6 +1493,7 @@ ShellRoot {
                             border.color: input.activeFocus ? "#5B86B8" : "#334056"
                         }
                         onAccepted: root.send()
+                        Keys.onEscapePressed: root.closeAssistant()
                     }
 
                     Button {
@@ -1506,23 +1527,6 @@ ShellRoot {
                 }
             }
         }
-    }
-
-    Shortcut {
-        sequence: "Escape"
-        onActivated: root.closeAssistant()
-    }
-
-    Shortcut {
-        sequence: "Ctrl+."
-        onActivated: {
-            if (root.autonomyActive || root.clickBusy) root.stopAutonomy("Autonomous task stopped")
-        }
-    }
-
-    Shortcut {
-        sequence: "Ctrl+L"
-        onActivated: root.newChat()
     }
 
     Component.onCompleted: {
