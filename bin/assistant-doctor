@@ -234,6 +234,19 @@ else
     report local-backend warn "not installed; run bin/assistant-config setup-image-models"
 fi
 
+log_helper="$app_dir/assistant_log.py"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+if [[ -x "$log_helper" ]] || [[ -f "$log_helper" ]]; then
+    log_dir="$state_home/omarchy-assistant"
+    if mkdir -p "$log_dir" 2>/dev/null && [[ -w "$log_dir" ]]; then
+        report action-log ok "writing to $log_dir"
+    else
+        report action-log fail "cannot write to $log_dir"
+    fi
+else
+    report action-log fail "assistant_log.py is missing, so the action history will not work"
+fi
+
 free_gb="$(df -BG --output=avail "$app_dir" 2>/dev/null | tail -n 1 | tr -dc '0-9')"
 if [[ -n "$free_gb" ]]; then
     if ((free_gb >= 20)); then

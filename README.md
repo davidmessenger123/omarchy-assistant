@@ -88,6 +88,26 @@ Keys cover the chat model and the optional escalate model, the image backend, bo
 
 It verifies required commands, `/dev/uinput` access, venv support, the settings file, the Hyprland config and keybinding, the git checkout and whether it is behind `origin`, the OpenCode install and model list, the Gemini key (without printing it), the local image backend including GPU runtime and cached weights, free disk space, and that screen capture actually works. It changes nothing and exits non-zero if any check fails.
 
+## Action history
+
+The **History** button shows what the assistant actually did: clicks with their position and target, typing targets, launched applications, generated images, opened files, screen captures, setting changes, and task starts and stops. It is stored locally at:
+
+```text
+$XDG_STATE_HOME/omarchy-assistant/action-log.jsonl
+```
+
+The default is `~/.local/state/omarchy-assistant/action-log.jsonl`, written with mode `0600`, trimmed to the most recent entries, and never leaves the machine. **Typed text is never stored**, only the target and the character count, because password managers put secrets on the clipboard. **Clear** in the panel empties it.
+
+## Confirming paid images
+
+Set `confirm_images` and every billable Gemini call waits for you:
+
+```bash
+./assistant_config.py set confirm_images true
+```
+
+The desktop app then shows a confirmation bar naming the prompt, backend, aspect ratio, and resolution before anything is sent. Approving writes a single-use approval, the assistant re-runs the turn with exactly the approved parameters, and the tool consumes the approval when it makes the call. Changing any parameter, or asking again afterwards, requires a new confirmation. The local SDXL-Turbo backend is free and never asks. The status line shows **Image approval** while a decision is pending.
+
 ## Image generation
 
 The chat model (Space Bunny) cannot create images, so the Assistant calls a dedicated `generate_image` tool. Ask for an image in plain language, for example "draw a watercolour of a lighthouse at dusk in 16:9". The Assistant picks the aspect ratio, saves the file under `~/Pictures/omarchy-assistant/`, and shows the image inline with an **Open** button. This version generates new images only; it cannot edit an existing image.

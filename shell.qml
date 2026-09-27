@@ -62,6 +62,11 @@ ShellRoot {
     property string settingsBuffer: ""
     property string settingsStatus: ""
     property bool settingsLoaded: false
+    property var actionLog: []
+    property bool historyVisible: false
+    property bool clearHistoryArmed: false
+    property string historyBuffer: ""
+    property var pendingImage: null
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
     readonly property string appDir: root.filePath(Qt.resolvedUrl("."))
@@ -247,6 +252,83 @@ ShellRoot {
     function saveSetting(key, value) {
         settingsWrite.command = ["/usr/bin/python3", root.appDir + "/assistant_config.py", "set", key, String(value)]
         settingsWrite.running = true
+        var name = String(key)
+        var sensitive = /key|secret|token|password/i.test(name)
+        root.logAction("settings", "Setting changed: " + name, sensitive ? "value not logged" : String(value))
+    }
+
+    function logAction(kind, summary, detail) {
+        var entry = { kind: String(kind || "note"), summary: String(summary || ""), detail: String(detail || "") }
+        root.actionLog = [entry].concat(root.actionLog).slice(0, 60)
+        logWrite.command = ["/usr/bin/python3", root.appDir + "/assistant_log.py", "append", JSON.stringify(entry)]
+        logWrite.running = true
+        if (root.historyVisible) root.refreshHistory()
+    }
+
+    function finishHistory() {
+        var parsed = null
+        try {
+            parsed = JSON.parse(root.historyBuffer.trim())
+        } catch (error) {
+            parsed = null
+        }
+        root.historyBuffer = ""
+        if (Array.isArray(parsed)) root.actionLog = parsed.slice(0, 60)
+    }
+
+    function refreshHistory() {
+        historyRead.command = ["/usr/bin/python3", root.appDir + "/assistant_log.py", "list", "--limit", "60"]
+        historyRead.running = true
+    }
+
+    function toggleHistory() {
+        root.historyVisible = !root.historyVisible
+        root.clearHistoryArmed = false
+        if (root.historyVisible) root.refreshHistory()
+    }
+
+    function clearHistory() {
+        if (!root.clearHistoryArmed) {
+            root.clearHistoryArmed = true
+            Qt.callLater(function() { root.clearHistoryArmed = false })
+            return
+        }
+        historyClear.command = ["/usr/bin/python3", root.appDir + "/assistant_log.py", "clear"]
+        historyClear.running = true
+        root.clearHistoryArmed = false
+        root.actionLog = []
+    }
+
+    function finishImageApproval() {
+        // The approval is on disk before the retry starts, so the tool can consume it.
+        var request = root.pendingImage ? root.pendingImage.request : null
+        root.pendingImage = null
+        if (!request) return
+        var retry = "The user approved this image request. Call generate_image now with exactly these arguments and change nothing else: " + JSON.stringify(request) + " Generate it once, then report the saved path."
+        root.requestModel(retry, "")
+    }
+
+    function approveImage() {
+        if (!root.pendingImage || imageApproval.running) return
+        imageApproval.command = ["/usr/bin/python3", root.appDir + "/assistant_log.py", "set-approval", JSON.stringify(root.pendingImage.request)]
+        imageApproval.running = true
+    }
+
+    function cancelImage() {
+        if (!root.pendingImage) return
+        root.pendingImage = null
+        imageApprovalClear.command = ["/usr/bin/python3", root.appDir + "/assistant_log.py", "clear-approval"]
+        imageApprovalClear.running = true
+        root.logAction("note", "Image generation declined", "no paid request was sent")
+    }
+
+    function actionKindLabel(kind) {
+        var labels = {
+            click: "Click", type: "Type", app: "App", image: "Image", file: "File", screen: "Screen",
+            web: "Web", memory: "Memory", settings: "Setting", update: "Update", task: "Task",
+            reminder: "Reminder", clipboard: "Clipboard", look: "Look", note: "Note"
+        }
+        return labels[String(kind || "")] || "Event"
     }
 
     function isImagePath(value) {
@@ -257,6 +339,7 @@ ShellRoot {
         var path = root.fileCandidate(value, true)
         if (!path) return
         Quickshell.execDetached(["/usr/bin/xdg-open", path])
+        root.logAction("file", "Opened " + root.fileLabel(path), path)
     }
 
     function screenIntent(prompt) {
@@ -448,6 +531,7 @@ ShellRoot {
         root.updateCurrent = String(parsed.current || "")
         root.updateAvailable = false
         root.updateStatus = "Updated; restarting assistant…"
+        root.logAction("update", "Updated to " + String(parsed.current || "").slice(0, 7), "fast-forward pull and dependency refresh")
         updateRestartDelay.restart()
     }
 
@@ -485,6 +569,7 @@ ShellRoot {
 
     function captureScreen() {
         if (screenCapture.running || !root.pendingPrompt) return
+        root.logAction("screen", "Captured the screen for context", "monitor chosen by the capture helper")
         screenCapture.command = [root.appDir + "/bin/screen_capture_secure", root.screenPath]
         screenCapture.running = true
         screenCaptureTimeout.restart()
@@ -596,6 +681,7 @@ ShellRoot {
     }
 
     function stopAutonomy(message) {
+        var wasActive = root.autonomyActive
         screenCaptureDelay.stop()
         screenCaptureTimeout.stop()
         clickDelay.stop()
@@ -609,6 +695,7 @@ ShellRoot {
         root.autonomyStep = 0
         root.autonomyFeedback = ""
         if (message) root.statusText = message
+        if (wasActive) root.logAction("task", "Guarded task finished", message || "completed")
         if (root.screenAttached) {
             root.cleanupScreen()
             root.screenAttached = false
@@ -622,6 +709,14 @@ ShellRoot {
         root.activeClick = action
         root.clickBusy = true
         root.statusText = automatic ? "Autonomous action" : "Action approved"
+        if (action.kind === "click") {
+            root.logAction("click", (automatic ? "Clicked " : "Approved click on ") + (action.target || "the screen"), Math.round(action.x * 100) + "% across, " + Math.round(action.y * 100) + "% down")
+        } else if (action.kind === "type") {
+            // Never store typed text: password managers put secrets on the clipboard.
+            root.logAction("type", "Typed into " + (action.target || "the focused field"), String(action.text || "").length + " characters")
+        } else if (action.kind === "open_application") {
+            root.logAction("app", "Launched " + (action.application || "an application"), action.target || "")
+        }
         assistant.visible = false
         clickDelay.restart()
     }
@@ -647,6 +742,7 @@ ShellRoot {
 
     function cancelClick() {
         if (root.clickBusy) return
+        if (root.pendingClick) root.logAction("note", "Declined a proposed action", root.actionDescription(root.pendingClick))
         root.pendingClick = null
         root.activeClick = null
         root.stopAutonomy("Autonomous task cancelled")
@@ -745,6 +841,21 @@ ShellRoot {
                 if (event.part.state) root.parseActionProposal(event.part.state.output)
             } else if (tool === "generate_image") {
                 root.statusText = "Creating image"
+                if (event.part.state) {
+                    var proposal = null
+                    try {
+                        proposal = JSON.parse(String(event.part.state.output || "").trim())
+                    } catch (error) {
+                        proposal = null
+                    }
+                    if (proposal && proposal.needs_confirmation === true && proposal.request) {
+                        root.pendingImage = { request: proposal.request }
+                        root.statusText = "Waiting for image approval"
+                    } else if (proposal && proposal.ok === true) {
+                        var seconds = proposal.generate_seconds ? " in " + proposal.generate_seconds + "s" : ""
+                        root.logAction("image", "Generated an image with " + String(proposal.backend || "the image backend") + (proposal.approved ? " after approval" : ""), String(proposal.width || "") + "x" + String(proposal.height || "") + (proposal.resolution ? " " + proposal.resolution : "") + seconds)
+                    }
+                }
             } else if (tool === "memory") {
                 root.statusText = "Updating memory"
             } else if (tool === "read") {
@@ -833,6 +944,7 @@ ShellRoot {
         root.autonomyActive = root.isAutonomyPrompt(prompt)
         if (root.autonomyActive) root.sessionId = ""
         root.autonomyTask = prompt
+        root.logAction("task", "Started a guarded task", String(prompt).slice(0, 120))
         root.autonomyStep = 0
         root.autonomyFeedback = ""
         root.approvedTargets = []
@@ -983,6 +1095,45 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: logWrite
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser { onRead: function(line) {} }
+    }
+
+    Process {
+        id: historyRead
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.historyBuffer += line }
+        }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) { root.finishHistory() }
+    }
+
+    Process {
+        id: historyClear
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser { onRead: function(line) {} }
+    }
+
+    Process {
+        id: imageApproval
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) { root.finishImageApproval() }
+    }
+
+    Process {
+        id: imageApprovalClear
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser { onRead: function(line) {} }
     }
 
     Process {
@@ -1299,6 +1450,28 @@ ShellRoot {
                     }
 
                     Button {
+                        id: historyButton
+                        text: root.historyVisible ? "History ✓" : "History"
+                        onClicked: {
+                            root.toggleHistory()
+                            input.forceActiveFocus()
+                        }
+                        contentItem: Text {
+                            text: historyButton.text
+                            color: "#DCE5F2"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 10
+                            color: root.historyVisible ? "#1D3A38" : "#273247"
+                            border.color: root.historyVisible ? "#477D6C" : "#3A465B"
+                        }
+                    }
+
+                    Button {
                         id: imageBackendButton
                         text: root.imageBackend === "gemini" ? "Img: Gemini" : root.imageBackend === "local" ? "Img: Local" : "Img: Auto"
                         onClicked: {
@@ -1579,6 +1752,157 @@ ShellRoot {
                 }
 
                 Rectangle {
+                    id: historyPanel
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: root.historyVisible ? 190 : 0
+                    visible: root.historyVisible
+                    radius: 14
+                    color: "#18202C"
+                    border.width: 1
+                    border.color: "#3B4A5E"
+                    clip: true
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        spacing: 6
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "Action history"
+                                color: "#9FE0C0"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                            }
+
+                            Text {
+                                text: "Clicks, typing targets, images, and settings. Typed text is never stored."
+                                color: "#7C8AA0"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 10
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 320
+                            }
+
+                            Button {
+                                id: clearHistoryButton
+                                text: root.clearHistoryArmed ? "Really clear" : "Clear"
+                                onClicked: root.clearHistory()
+                                contentItem: Text {
+                                    text: clearHistoryButton.text
+                                    color: root.clearHistoryArmed ? "#FFD7DE" : "#DCE5F2"
+                                    font.family: "Sans Serif"
+                                    font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 8
+                                    color: root.clearHistoryArmed ? "#5A2A33" : "#273247"
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            radius: 10
+                            color: "#10151E"
+                            border.width: 1
+                            border.color: "#293346"
+                            clip: true
+
+                            Text {
+                                anchors.centerIn: parent
+                                visible: root.actionLog.length === 0
+                                text: "Nothing logged yet"
+                                color: "#718096"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 12
+                            }
+
+                            ListView {
+                                id: historyList
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                clip: true
+                                spacing: 4
+                                model: root.actionLog
+                                onCountChanged: Qt.callLater(function() { historyList.positionViewAtBeginning() })
+
+                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                                delegate: Rectangle {
+                                    id: historyDelegate
+                                    required property var modelData
+                                    required property int index
+                                    width: historyList.width
+                                    height: 38
+                                    radius: 8
+                                    color: index % 2 === 0 ? "#161D28" : "#131A24"
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 8
+                                        anchors.rightMargin: 8
+                                        spacing: 8
+
+                                        Text {
+                                            text: String(historyDelegate.modelData.time || "")
+                                            color: "#7C8AA0"
+                                            font.family: "Sans Serif"
+                                            font.pixelSize: 10
+                                            Layout.preferredWidth: 58
+                                        }
+
+                                        Rectangle {
+                                            Layout.preferredWidth: 54
+                                            Layout.preferredHeight: 17
+                                            radius: 5
+                                            color: "#1E2A3A"
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: root.actionKindLabel(historyDelegate.modelData.kind)
+                                                color: "#9CC7FF"
+                                                font.family: "Sans Serif"
+                                                font.pixelSize: 9
+                                            }
+                                        }
+
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 0
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: String(historyDelegate.modelData.summary || "")
+                                                color: "#E6EDF5"
+                                                font.family: "Sans Serif"
+                                                font.pixelSize: 11
+                                                elide: Text.ElideRight
+                                            }
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: String(historyDelegate.modelData.detail || "")
+                                                color: "#7C8AA0"
+                                                font.family: "Sans Serif"
+                                                font.pixelSize: 9
+                                                elide: Text.ElideRight
+                                                visible: text !== ""
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
                     id: memoryPanel
                     Layout.fillWidth: true
                     Layout.preferredHeight: root.memoryVisible ? 170 : 0
@@ -1664,6 +1988,99 @@ ShellRoot {
                                 }
                             }
                             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    id: imageConfirmation
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: root.pendingImage !== null ? 78 : 0
+                    visible: root.pendingImage !== null
+                    radius: 14
+                    color: "#2B2417"
+                    border.width: 1
+                    border.color: "#C58A5A"
+                    clip: true
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        spacing: 10
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "This image costs money — the Gemini API is billed per image"
+                                color: "#F4E7D2"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 13
+                                font.weight: Font.DemiBold
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.pendingImage !== null ? String(root.pendingImage.request.prompt || "") : ""
+                                color: "#F4F7FB"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 12
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.pendingImage !== null
+                                    ? String(root.pendingImage.request.backend) + " • " + String(root.pendingImage.request.aspect_ratio) + " • " + String(root.pendingImage.request.resolution)
+                                      + " • local generation is free and never asks"
+                                    : ""
+                                color: "#C9B79A"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 10
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        RowLayout {
+                            spacing: 6
+                            Button {
+                                id: approveImageButton
+                                text: "Generate"
+                                onClicked: root.approveImage()
+                                contentItem: Text {
+                                    text: approveImageButton.text
+                                    color: "#0D1420"
+                                    font.family: "Sans Serif"
+                                    font.pixelSize: 12
+                                    font.weight: Font.DemiBold
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 9
+                                    color: "#E8C48A"
+                                }
+                            }
+                            Button {
+                                id: cancelImageButton
+                                text: "Cancel"
+                                onClicked: root.cancelImage()
+                                contentItem: Text {
+                                    text: cancelImageButton.text
+                                    color: "#DCE5F2"
+                                    font.family: "Sans Serif"
+                                    font.pixelSize: 12
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    radius: 9
+                                    color: "#273247"
+                                }
+                            }
                         }
                     }
                 }
@@ -1833,7 +2250,7 @@ ShellRoot {
 
                 Text {
                     Layout.fillWidth: true
-                    text: root.statusText + (root.autoMode ? "  •  Auto" : "  •  Manual actions") + (root.autonomyActive ? "  •  Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps : "") + (root.screenAttached || root.forceScreen ? "  •  Screen context" : "") + (root.pendingClick !== null ? "  •  Confirmation" : "") + (root.memoryCount > 0 ? "  •  Memory " + root.memoryCount : "") + (root.activeSources.length > 0 ? "  •  " + root.activeSources.length + " source" + (root.activeSources.length === 1 ? "" : "s") : "") + (root.activeFiles.length > 0 ? "  •  " + root.activeFiles.length + " file" + (root.activeFiles.length === 1 ? "" : "s") : "") + "  •  Enter to send  •  Ctrl+. stop task  •  Ctrl+L new chat  •  Esc close"
+                    text: root.statusText + (root.autoMode ? "  •  Auto" : "  •  Manual actions") + (root.autonomyActive ? "  •  Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps : "") + (root.screenAttached || root.forceScreen ? "  •  Screen context" : "") + (root.pendingClick !== null ? "  •  Confirmation" : "") + (root.pendingImage !== null ? "  •  Image approval" : "") + (root.memoryCount > 0 ? "  •  Memory " + root.memoryCount : "") + (root.activeSources.length > 0 ? "  •  " + root.activeSources.length + " source" + (root.activeSources.length === 1 ? "" : "s") : "") + (root.activeFiles.length > 0 ? "  •  " + root.activeFiles.length + " file" + (root.activeFiles.length === 1 ? "" : "s") : "") + "  •  Enter to send  •  Ctrl+. stop task  •  Ctrl+L new chat  •  Esc close"
                     color: "#7F8B9D"
                     font.family: "Sans Serif"
                     font.pixelSize: 11

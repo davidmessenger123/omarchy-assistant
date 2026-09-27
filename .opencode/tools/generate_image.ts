@@ -29,6 +29,12 @@ function setting(settings: Settings, envName: string, key: string, fallback: unk
     return fallback
 }
 
+function flag(settings: Settings, envName: string, key: string, fallback = false) {
+    const value = setting(settings, envName, key, fallback)
+    if (typeof value === "boolean") return value
+    return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase())
+}
+
 const aspectRatios = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
 const resolutions = ["1K", "2K", "4K"]
 const maxBytes = 64 * 1024 * 1024
@@ -69,6 +75,34 @@ async function resolveKey() {
         if (stored.length >= 20) return { key: stored, source: file, file }
     } catch {}
     return { key: "", source: file, file }
+}
+
+function stateDir() {
+    return join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "omarchy-assistant")
+}
+
+function approvalPath() {
+    return join(stateDir(), "image-approval.json")
+}
+
+// A paid call needs a one-time approval written by the desktop app after the
+// user accepts the confirmation dialog. The approval is consumed on use.
+async function consumeApproval(request: Record<string, unknown>) {
+    let approval: any = null
+    try {
+        approval = JSON.parse(await readFile(approvalPath(), "utf8"))
+    } catch {
+        return false
+    }
+    if (!approval || typeof approval !== "object") return false
+    const matches =
+        String(approval.prompt || "") === String(request.prompt) &&
+        String(approval.backend || "") === String(request.backend) &&
+        String(approval.aspect_ratio || "") === String(request.aspect_ratio) &&
+        String(approval.resolution || "") === String(request.resolution)
+    if (!matches) return false
+    await unlink(approvalPath()).catch(() => {})
+    return true
 }
 
 async function outputDir(settings: Settings) {
@@ -282,7 +316,7 @@ async function generateLocally(options: { python: string; model: string; timeout
 }
 
 export default tool({
-    description: "Generate an image from a text prompt and save it under the user's Pictures directory. Two backends: 'gemini' calls Google's Gemini image model for the highest quality and best text-in-image, and 'local' runs SDXL-Turbo on the user's own GPU, which is private, offline, and free but lower quality and capped near 1024 pixels. Use 'auto' to let the app choose. Use this when the user asks to create, draw, generate, design, or make a picture, logo, illustration, poster, or photo. The tool returns the saved absolute path. It cannot edit an existing image and it never overwrites files.",
+    description: "Generate an image from a text prompt and save it under the user's Pictures directory. Two backends: 'gemini' calls Google's Gemini image model for the highest quality and best text-in-image, and 'local' runs SDXL-Turbo on the user's own GPU, which is private, offline, and free but lower quality and capped near 1024 pixels. Use 'auto' to let the app choose. Use this when the user asks to create, draw, generate, design, or make a picture, logo, illustration, poster, or photo. The tool returns the saved absolute path. It cannot edit an existing image and it never overwrites files. When the user has asked to approve paid images, the result asks for confirmation instead of calling the API; in that case wait for the user's approval and then call this tool again with exactly the arguments you were given.",
     args: {
         prompt: tool.schema.string().describe("Detailed description of the image to generate, including subject, style, composition, lighting, and any text that should appear."),
         backend: tool.schema.string().describe("Backend: gemini, local, or auto. Defaults to the user's configured preference."),
@@ -325,10 +359,9 @@ export default tool({
             return failure("The local image backend is not installed. Ask the user to run bin/assistant-config setup-image-models; the first run also downloads several GB of weights.", { configured: false })
         }
 
-        const limited = await recordAttempt(settings)
-        if (limited) return failure(limited)
-
         if (backend === "local") {
+            const localLimit = await recordAttempt(settings)
+            if (localLimit) return failure(localLimit)
             return JSON.stringify(
                 await generateLocally(
                     {
@@ -347,6 +380,26 @@ export default tool({
         if (!credential.key) {
             return failure("Image generation is not configured. Ask the user to run bin/assistant-config set-key in the assistant directory, or to export GEMINI_API_KEY, then try again. The local backend is also available after bin/assistant-config setup-image-models.", { configured: false })
         }
+
+        // Billable calls can require an explicit approval, which the desktop app
+        // grants after the user accepts the confirmation dialog. The rate limit
+        // is only spent once a call is actually going out, so a refusal that is
+        // waiting for the user cannot lock them out.
+        let approved = false
+        if (flag(settings, "ASSISTANT_CONFIRM_IMAGES", "confirm_images")) {
+            const request = { prompt, backend: "gemini", aspect_ratio: aspectRatio, resolution }
+            approved = await consumeApproval(request)
+            if (!approved) {
+                return failure(
+                    "The user has not approved this image yet. The desktop app will ask them to confirm, then ask you to call generate_image again with exactly these arguments.",
+                    { needs_confirmation: true, request }
+                )
+            }
+        }
+
+        const geminiLimit = await recordAttempt(settings)
+        if (geminiLimit) return failure(geminiLimit)
+
         const result = await generateWithGemini(
             {
                 key: credential.key,
@@ -361,6 +414,6 @@ export default tool({
             String(args.filename || "").trim()
         )
         if (!result.ok) return failure(result.error as string, { backend: "gemini" })
-        return JSON.stringify({ action: "generate_image", ...result })
+        return JSON.stringify({ action: "generate_image", ...(approved ? { approved: true } : {}), ...result })
     }
 })
