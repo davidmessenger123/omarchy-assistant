@@ -74,9 +74,18 @@ Runs SDXL-Turbo on the NVIDIA GPU through a private virtual environment, so noth
 ./bin/assistant-config image-status          # GPU, torch, and cached-weight report
 ```
 
-The first command creates `~/.local/share/omarchy-assistant/image-venv`, installs PyTorch and diffusers, and downloads the SDXL-Turbo weights (about 7 GB). The first generation also pays a one-time model load of several seconds. SDXL-Turbo needs about 6 GB of VRAM; smaller cards work because the weights stream from system RAM, and the helper automatically stays on the CPU when no CUDA GPU is visible.
+The first command creates `~/.local/share/omarchy-assistant/image-venv`, installs PyTorch and diffusers, and downloads the SDXL-Turbo weights (about 7 GB). SDXL-Turbo needs about 5 GB of VRAM; smaller cards work because the weights stream from system RAM, and the helper automatically stays on the CPU when no CUDA GPU is visible.
 
-On a 6 GB laptop GPU expect roughly 1-3 seconds per 1024-pixel image after the model is loaded, and noticeably weaker results than Gemini for photorealism, precise composition, and any text inside the image. Use `local` for drafts, iterations, private subjects, and offline work; switch to `gemini` for the final image.
+Measured on an RTX A3000 Laptop GPU with 6 GB of VRAM, using model offload:
+
+| Size | Steps | Time |
+| --- | --- | --- |
+| 512x512 | 2 | ~6 s |
+| 768x768 | 2 | ~8-9 s |
+| 768x768 | 4 | ~10 s |
+| 1024x576 (16:9) | 2 | ~10-11 s |
+
+Each request also pays a one-off ~5 s model load, so a single image takes roughly 13-16 s end to end. Extra steps barely change the time, because streaming the weights dominates on a card this size. Quality is good for drafts, stylised art, and private subjects, and noticeably weaker than Gemini for photorealism, precise composition, and text inside the image. Use `local` for drafts, iterations, private subjects, and offline work; switch to `gemini` for the final image.
 
 ### Notes
 
