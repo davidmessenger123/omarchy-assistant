@@ -202,6 +202,9 @@ can check itself:
 ASSISTANT_SELFTEST=1 quickshell --path ./shell.qml   # prints SELFTEST PASS/FAIL, then exits
 ```
 
+It covers a change being proposed, the plan landing before or after the turn ends, a
+plan that fails, a check that never answers, and a second change in one turn.
+
 ## Checking an installation
 
 ```bash

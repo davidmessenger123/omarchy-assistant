@@ -27,6 +27,8 @@ ShellRoot {
     property var proposedAction: null
     property var windowProposal: null
     property bool requestFinished: false
+    property bool windowPlanPending: false
+    property int windowPlanTimeout: parseInt(Quickshell.env("ASSISTANT_WINDOW_PLAN_TIMEOUT") || "20000")
     property int requestExitCode: 0
     // ASSISTANT_SELFTEST=1 exercises the action hand-off and exits. The ordering
     // between a finished model turn and a window plan resolving in another
@@ -837,21 +839,68 @@ ShellRoot {
             results.push((actual === wanted ? "PASS " : "FAIL ") + name + " (got " + actual + ", wanted " + wanted + ")")
         }
 
-        // A window plan resolving after the model finished must not be lost.
+        // Drive the real hand-off: a plan is asked for, the turn ends before the
+        // answer lands, then the answer arrives. This is the sequence that used to
+        // lose the proposal, and then wedge every turn after it.
         root.proposedAction = null
         root.pendingClick = null
         root.requestFinished = false
+        root.windowPlanPending = true
         root.windowProposal = { op: "focus", target: "selftest" }
         root.finishRequest(0)
         expect("a turn waits for a window plan in flight", root.requestFinished, true)
         expect("nothing is shown while the plan is in flight", root.pendingClick === null, true)
+        expect("a plan in flight is tracked", root.windowPlanPending, true)
 
-        root.windowProposal = null
-        root.proposedAction = { kind: "window", op: "focus", summary: "selftest change", requiresApproval: true, risk: "low" }
-        root.completeRequest(0)
-        expect("the deferred turn still shows the card", root.pendingClick !== null, true)
+        root.windowPlanBuffer = JSON.stringify({ ok: true, op: "focus", summary: "selftest change", detail: "selftest detail" })
+        root.finishWindowPlan()
+        expect("the deferred turn shows the card", root.pendingClick !== null, true)
         expect("the card keeps the change for approval", root.pendingClick && root.pendingClick.summary === "selftest change", true)
         expect("a window change is never auto-run", root.pendingClick && root.pendingClick.requiresApproval === true, true)
+        expect("no plan is left pending once it lands", root.windowPlanPending, false)
+        expect("the proposal is released once it lands", root.windowProposal, null)
+        expect("the turn is no longer marked waiting", root.requestFinished, false)
+
+        // The turn after that must not be left waiting for a plan that already
+        // arrived. This is the one that wedged the assistant as "thinking".
+        root.pendingClick = null
+        root.finishRequest(0)
+        expect("the next turn is not deferred", root.requestFinished, false)
+        expect("the next turn still shows its card", root.pendingClick === null, true)
+
+        // A plan that lands before the turn ends is shown the same way.
+        root.pendingClick = null
+        root.proposedAction = null
+        root.windowPlanPending = true
+        root.windowPlanBuffer = JSON.stringify({ ok: true, op: "move", summary: "selftest second", detail: "" })
+        root.finishWindowPlan()
+        expect("an early plan waits for the turn to end", root.pendingClick === null, true)
+        root.finishRequest(0)
+        expect("the turn shows the early plan too", root.pendingClick !== null && root.pendingClick.summary === "selftest second", true)
+
+        // A plan that fails must not leave the turn waiting either.
+        root.pendingClick = null
+        root.proposedAction = null
+        root.windowPlanPending = true
+        root.windowPlanBuffer = JSON.stringify({ ok: false, error: "selftest could not find it" })
+        root.finishWindowPlan()
+        expect("a failed plan clears the wait", root.requestFinished, false)
+        expect("a failed plan leaves nothing pending", root.windowPlanPending, false)
+        root.finishRequest(0)
+        expect("a turn after a failed plan is not deferred", root.requestFinished, false)
+
+        // A check that never answers must not leave the assistant stuck.
+        root.windowPlanPending = true
+        root.requestFinished = true
+        root.pendingClick = null
+        var beforeExpiry = messages.count
+        root.expireWindowPlan()
+        expect("a stalled check is given up on", root.windowPlanPending, false)
+        expect("a stalled check says what happened", messages.count === beforeExpiry + 1, true)
+        expect("a stalled check leaves no card", root.pendingClick === null, true)
+        expect("a stalled check ends the wait", root.requestFinished, false)
+        root.finishRequest(0)
+        expect("a turn after a stalled check is not deferred", root.requestFinished, false)
 
         // A second change in one turn is refused, and says so out loud.
         var before = messages.count
@@ -874,10 +923,11 @@ ShellRoot {
     }
 
     function planWindow(proposal) {
-        if (root.proposedAction !== null || root.pendingClick !== null || windowPlan.running || root.windowProposal !== null) {
+        if (root.proposedAction !== null || root.pendingClick !== null || root.windowPlanPending) {
             root.refuseSecondChange()
             return
         }
+        root.windowPlanPending = true
         root.windowProposal = {
             op: String(proposal.op || ""),
             target: String(proposal.target || ""),
@@ -897,10 +947,27 @@ ShellRoot {
         root.statusText = "Checking the windows"
         windowPlan.command = ["/usr/bin/python3", root.appDir + "/assistant_windows.py"].concat(args)
         windowPlan.running = true
+        windowPlanTimer.interval = root.windowPlanTimeout
+        windowPlanTimer.restart()
+    }
+
+    // If the check never answers, give up rather than leaving the assistant stuck
+    // on "thinking" for this turn and every turn after it.
+    function expireWindowPlan() {
+        if (!root.windowPlanPending) return
+        root.windowPlanPending = false
+        root.windowProposal = null
+        if (windowPlan.running) windowPlan.signal(15)
+        root.errorText = "Checking the windows did not answer in time."
+        addMessage("assistant", "I could not check your windows, so nothing was changed. Try again in a moment.")
+        if (root.requestFinished) root.completeRequest(root.requestExitCode)
     }
 
     function finishWindowPlan() {
         if (windowPlan.running) return
+        // Cleared before anything else: the plan has landed, so the turn must not
+        // keep waiting for it. Leaving this set is what wedged the assistant.
+        root.windowPlanPending = false
         var plan = null
         try {
             plan = JSON.parse(root.windowPlanBuffer.trim())
@@ -932,8 +999,8 @@ ShellRoot {
             requiresApproval: true,
             risk: ""
         }
+        root.windowProposal = null
         if (root.proposedAction !== null || root.pendingClick !== null) {
-            root.windowProposal = null
             root.refuseSecondChange()
             return
         }
@@ -1051,6 +1118,7 @@ ShellRoot {
         root.autonomyStep = 0
         root.autonomyFeedback = ""
         root.requestFinished = false
+        root.windowPlanPending = false
         if (message) root.statusText = message
         if (wasActive) root.logAction("task", "Guarded task finished", message || "completed")
         if (root.screenAttached) {
@@ -1363,7 +1431,7 @@ ShellRoot {
         }
         // A window change resolves in a separate process, so its answer can arrive
         // after the model has finished. Wait for it, or the approval card is lost.
-        if (windowPlan.running || root.windowProposal !== null) {
+        if (root.windowPlanPending) {
             root.requestFinished = true
             root.requestExitCode = exitCode
             return
@@ -1535,6 +1603,7 @@ ShellRoot {
         root.autonomyStep = 0
         root.autonomyFeedback = ""
         root.requestFinished = false
+        root.windowPlanPending = false
         root.approvedTargets = []
         root.looksUsed = 0
         input.text = ""
@@ -1700,6 +1769,13 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Timer {
+        id: windowPlanTimer
+        interval: 20000
+        repeat: false
+        onTriggered: root.expireWindowPlan()
     }
 
     Timer {
