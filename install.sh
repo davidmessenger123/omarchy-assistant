@@ -95,7 +95,7 @@ if ! python3 -c 'import venv' >/dev/null 2>&1; then
     printf 'Warning: python3 cannot create virtual environments.\n' >&2
     printf 'Install the venv module (Arch: pacman -S python; Debian/Ubuntu: python3-venv) before setting up the image model.\n' >&2
 fi
-chmod +x "$script_dir/run.sh" "$script_dir/screen_click.py" "$script_dir/assistant_memory.py" "$script_dir/assistant_update.py" "$script_dir/assistant_image_local.py" "$script_dir/bin/assistant-config" "$script_dir/bin/install-keybind" "$script_dir/bin/screen_capture" "$script_dir/bin/screen_capture_secure"
+chmod +x "$script_dir/run.sh" "$script_dir/screen_click.py" "$script_dir/assistant_memory.py" "$script_dir/assistant_update.py" "$script_dir/assistant_image_local.py" "$script_dir/bin/assistant-config" "$script_dir/bin/install-keybind" "$script_dir/bin/screen_capture" "$script_dir/bin/screen_capture_secure" "$script_dir/assistant_windows.py"
 npm install --prefix "$script_dir/.opencode"
 printf 'Installed OpenCode tool dependencies.\n'
 

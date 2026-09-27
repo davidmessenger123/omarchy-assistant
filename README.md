@@ -100,6 +100,40 @@ omarchy pkg add voxtype-bin
 
 If the tool is missing, the button says so instead of failing silently. `dictation_command` in settings points it at a different tool if you prefer.
 
+## Window and workspace control
+
+The assistant can read your window list and arrange what is open, which is usually
+what you want when you say "put these side by side" or "move my browser to the big
+monitor". It asks before every change and shows exactly what it will do.
+
+Ask for things like:
+
+- "what's open right now?" — answered straight away, nothing is changed
+- "focus the browser"
+- "move Teams to the left monitor"
+- "put foot and brave side by side"
+- "switch to workspace 3"
+- "fullscreen this" or "send it to the scratchpad"
+- "resize it to 1200 by 800"
+
+Windows are named by class (`foot`), by a distinctive piece of the title, or by
+address. If a name matches more than one window the assistant is told the candidates
+and asks you which one you meant rather than guessing. Destinations accept a
+workspace number or name, or `monitor:left`, `monitor:right`, and a monitor name.
+
+Two deliberate limits. There is **no way to close or kill a window**, so a runaway
+window still needs your own hands. And `tile` **floats** the windows it places,
+because Hyprland's tiling layout will not honour exact coordinates for a tiled
+window; ask to unfloat them, or use your layout's own key, to put them back.
+
+## Typing longer text
+
+For anything longer than a few words the assistant uses a text-entry tool built for
+it rather than simulated keystrokes, so newlines, lists, code, quotes, and
+non-English characters arrive intact. It accepts up to 20000 characters. It
+deliberately does **not** go through the clipboard, so whatever you had copied is
+left alone.
+
 ## Choosing which monitor is captured
 
 `screen_monitor` decides what the assistant sees when it looks at your screen:

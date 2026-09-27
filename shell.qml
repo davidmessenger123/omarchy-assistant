@@ -25,6 +25,9 @@ ShellRoot {
     property string pendingPrompt: ""
     property var pendingClick: null
     property var proposedAction: null
+    property var windowProposal: null
+    property string windowPlanBuffer: ""
+    property string windowRunBuffer: ""
     property var activeClick: null
     property var approvedTargets: []
     property bool clickBusy: false
@@ -423,7 +426,7 @@ ShellRoot {
         var labels = {
             click: "Click", type: "Type", app: "App", image: "Image", file: "File", screen: "Screen",
             web: "Web", memory: "Memory", settings: "Setting", update: "Update", task: "Task",
-            reminder: "Reminder", clipboard: "Clipboard", look: "Look", note: "Note"
+            reminder: "Reminder", clipboard: "Clipboard", look: "Look", note: "Note", window: "Window"
         }
         return labels[String(kind || "")] || "Event"
     }
@@ -723,6 +726,7 @@ ShellRoot {
         if (!action) return "action"
         if (action.kind === "type") return "type into " + action.target
         if (action.kind === "open_application") return "launch " + action.target
+        if (action.kind === "window") return String(action.summary || "change the windows").toLowerCase()
         return "click " + action.target
     }
 
@@ -730,6 +734,7 @@ ShellRoot {
         if (!action) return ""
         if (action.kind === "click") return "click|" + String(action.target || "").toLowerCase() + "|" + String(action.x) + "," + String(action.y)
         if (action.kind === "type") return "type|" + String(action.target || "").toLowerCase() + "|" + String(action.text || "")
+        if (action.kind === "window") return "window|" + String(action.op || "") + "|" + String(action.target || "").toLowerCase()
         return "open|" + String(action.application || action.target || "").toLowerCase()
     }
 
@@ -772,13 +777,18 @@ ShellRoot {
             var typed = String(proposal.text || "")
             var target = String(proposal.target || "").trim()
             if (!typed || !target || typed.indexOf("\u0000") !== -1) return
-            action = { kind: "type", text: typed.slice(0, 4000), target: target.slice(0, 200), enter: proposal.enter === true, risk: proposal.risk === "high" ? "high" : "" }
+            // type_text is allowed longer text than screen_type's short proposals.
+            var limit = proposal.source === "type_text" ? 20000 : 4000
+            action = { kind: "type", text: typed.slice(0, limit), target: target.slice(0, 200), enter: proposal.enter === true, source: String(proposal.source || ""), risk: proposal.risk === "high" ? "high" : "" }
         } else if (proposal.action === "open_application") {
             var source = String(proposal.source || "")
             var application = String(proposal.application || proposal.target || "").trim()
             var applicationId = String(proposal.id || "").trim()
             if (!application || !/^[A-Za-z0-9._-]+$/.test(applicationId) || source.indexOf("/") !== 0 || source.indexOf("..") !== -1 || source.indexOf("/applications/") === -1 || source.slice(-8) !== ".desktop" || source.slice(-(applicationId.length + 9)) !== "/" + applicationId + ".desktop") return
             action = { kind: "open_application", application: application.slice(0, 128), id: applicationId, exec: String(proposal.exec || "").slice(0, 512), target: application.slice(0, 128), source: source, risk: proposal.risk === "high" ? "high" : "" }
+        } else if (proposal.action === "window") {
+            root.planWindow(proposal)
+            return
         }
         if (!action) return
         if (root.proposedAction !== null) {
@@ -787,6 +797,108 @@ ShellRoot {
         }
         root.proposedAction = root.classifyActionRisk(action)
         root.statusText = "Action proposed"
+    }
+
+    function planWindow(proposal) {
+        if (root.proposedAction !== null || root.pendingClick !== null) {
+            root.errorText = "Only one computer action is allowed per turn."
+            return
+        }
+        if (windowPlan.running) return
+        root.windowProposal = {
+            op: String(proposal.op || ""),
+            target: String(proposal.target || ""),
+            to: String(proposal.to || ""),
+            other: String(proposal.other || ""),
+            width: Number(proposal.width) || 0,
+            height: Number(proposal.height) || 0,
+            direction: String(proposal.direction || "left")
+        }
+        var args = ["plan", root.windowProposal.op]
+        if (root.windowProposal.target) args.push(root.windowProposal.target)
+        if (root.windowProposal.other) args.push("--other", root.windowProposal.other)
+        if (root.windowProposal.to) args.push("--to", root.windowProposal.to)
+        if (root.windowProposal.width > 0) args.push("--width", String(root.windowProposal.width))
+        if (root.windowProposal.height > 0) args.push("--height", String(root.windowProposal.height))
+        if (root.windowProposal.op === "tile") args.push("--direction", root.windowProposal.direction)
+        root.statusText = "Checking the windows"
+        windowPlan.command = ["/usr/bin/python3", root.appDir + "/assistant_windows.py"].concat(args)
+        windowPlan.running = true
+    }
+
+    function finishWindowPlan() {
+        if (windowPlan.running) return
+        var plan = null
+        try {
+            plan = JSON.parse(root.windowPlanBuffer.trim())
+        } catch (error) {
+            plan = null
+        }
+        root.windowPlanBuffer = ""
+        if (!plan || plan.ok !== true) {
+            var message = plan && plan.error ? String(plan.error) : "The window could not be found."
+            root.errorText = message.slice(0, 300)
+            root.statusText = "Nothing changed"
+            addMessage("assistant", "I could not do that: " + message)
+            root.windowProposal = null
+            if (root.autonomyActive) root.stopAutonomy("Window not found")
+            return
+        }
+        if (plan.query === true || plan.op === "list") {
+            root.windowProposal = null
+            return
+        }
+        var action = {
+            kind: "window",
+            op: String(plan.op || ""),
+            target: String(plan.summary || ""),
+            summary: String(plan.summary || "change the windows"),
+            detail: String(plan.detail || ""),
+            plan: plan,
+            requiresApproval: true,
+            risk: ""
+        }
+        if (root.proposedAction !== null) {
+            root.errorText = "Only one computer action is allowed per turn."
+            root.windowProposal = null
+            return
+        }
+        root.proposedAction = root.classifyActionRisk(action)
+        root.statusText = "Action proposed"
+    }
+
+    function finishWindowRun(exitCode) {
+        if (windowRun.running) return
+        var request = root.activeClick
+        var result = null
+        try {
+            result = JSON.parse(root.windowRunBuffer.trim())
+        } catch (error) {
+            result = null
+        }
+        root.windowRunBuffer = ""
+        root.activeClick = null
+        root.clickBusy = false
+        if (exitCode !== 0 || !result || result.ok !== true) {
+            var message = result && result.error ? String(result.error) : "the change did not apply"
+            addMessage("assistant", "That did not work: " + message + ".")
+            root.statusText = "Nothing changed"
+            root.logAction("note", "A window change failed", message.slice(0, 200))
+        } else {
+            root.statusText = "Action complete"
+            addMessage("assistant", "Done: " + (request && request.summary ? request.summary : "the windows were changed") + ".")
+        }
+        if (root.screenAttached) {
+            root.cleanupScreen()
+            root.screenAttached = false
+        }
+        assistant.visible = true
+        Qt.callLater(function() { input.forceActiveFocus() })
+    }
+
+    function runWindow(plan) {
+        windowRun.command = ["/usr/bin/python3", root.appDir + "/assistant_windows.py", "run", JSON.stringify(plan)]
+        windowRun.running = true
     }
 
     function stopAutonomy(message) {
@@ -798,6 +910,8 @@ ShellRoot {
         if (screenClick.running) screenClick.signal(15)
         if (screenType.running) screenType.signal(15)
         if (screenOpen.running) screenOpen.signal(15)
+        if (windowPlan.running) windowPlan.signal(15)
+        if (windowRun.running) windowRun.signal(15)
         root.activeClick = null
         root.clickBusy = false
         root.autonomyActive = false
@@ -822,9 +936,11 @@ ShellRoot {
             root.logAction("click", (automatic ? "Clicked " : "Approved click on ") + (action.target || "the screen"), Math.round(action.x * 100) + "% across, " + Math.round(action.y * 100) + "% down")
         } else if (action.kind === "type") {
             // Never store typed text: password managers put secrets on the clipboard.
-            root.logAction("type", "Typed into " + (action.target || "the focused field"), String(action.text || "").length + " characters")
+            root.logAction("type", "Typed into " + (action.target || "the focused field"), String(action.text || "").length + " characters" + (action.source === "type_text" ? ", long entry" : ""))
         } else if (action.kind === "open_application") {
             root.logAction("app", "Launched " + (action.application || "an application"), action.target || "")
+        } else if (action.kind === "window") {
+            root.logAction("window", String(action.summary || "Changed the windows"), String(action.detail || ""))
         }
         assistant.visible = false
         clickDelay.restart()
@@ -903,6 +1019,8 @@ ShellRoot {
         } else if (request.kind === "open_application") {
             screenOpen.command = ["/bin/sh", "-c", "/usr/bin/uwsm-app \"$1\" >/dev/null 2>&1 &", "assistant", request.source]
             screenOpen.running = true
+        } else if (request.kind === "window") {
+            root.runWindow(request.plan || {})
         } else {
             root.clickBusy = false
             root.stopAutonomy("Unsupported action")
@@ -974,9 +1092,41 @@ ShellRoot {
             } else if (tool === "glob" || tool === "grep" || tool === "list") {
                 root.statusText = "Searching files"
                 if (event.part.state) root.collectFiles(event.part.state.output, true)
-            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type") {
+            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control") {
                 root.statusText = tool === "open_application" ? "Preparing application" : "Preparing action"
                 if (event.part.state) root.parseActionProposal(event.part.state.output)
+            } else if (tool === "read_clipboard") {
+                root.statusText = "Reading the clipboard"
+                if (event.part.state) {
+                    // Only the purpose is ever recorded: clipboard contents are never logged.
+                    var clip = null
+                    try {
+                        clip = JSON.parse(String(event.part.state.output || "").trim())
+                    } catch (error) {
+                        clip = null
+                    }
+                    if (clip && clip.ok === true) {
+                        root.logAction("clipboard", "Read the clipboard", String(clip.purpose || "no reason given").slice(0, 120))
+                    } else if (clip && clip.error) {
+                        root.logAction("note", "Clipboard not read", String(clip.error).slice(0, 160))
+                    }
+                }
+            } else if (tool === "set_reminder") {
+                root.statusText = "Setting a reminder"
+                if (event.part.state) {
+                    var note = null
+                    try {
+                        note = JSON.parse(String(event.part.state.output || "").trim())
+                    } catch (error) {
+                        note = null
+                    }
+                    if (note && note.ok === true) {
+                        var when = note.minutes ? "in " + note.minutes + " minutes" : String(note.when || "now")
+                        root.logAction("reminder", "Reminder " + String(note.action || "set"), when + ": " + String(note.message || "").slice(0, 120))
+                    } else if (note && note.error) {
+                        root.logAction("note", "Reminder not set", String(note.error).slice(0, 160))
+                    }
+                }
             } else if (tool === "generate_image") {
                 root.statusText = "Creating image"
                 if (event.part.state) {
@@ -1030,6 +1180,10 @@ ShellRoot {
                     }
                     if (look && look.ok === true) root.requestLook(look)
                 }
+            } else if (tool === "type_text") {
+                root.statusText = "Preparing text"
+            } else if (tool === "window_control") {
+                root.statusText = "Checking the windows"
             } else if (tool === "memory") {
                 root.statusText = "Updating memory"
             } else if (tool === "read") {
@@ -1081,7 +1235,7 @@ ShellRoot {
             if (root.autonomyActive) root.stopAutonomy("Autonomous task stopped")
         } else if (action !== null) {
             root.pendingClick = null
-            if (action.risk === "low" && root.autoMode && root.autonomyActive) {
+            if (action.risk === "low" && !action.requiresApproval && root.autoMode && root.autonomyActive) {
                 if (root.autonomyStep >= root.maxAutonomySteps) {
                     addMessage("assistant", "I stopped before the next action because the autonomous step limit was reached.")
                     root.stopAutonomy("Autonomous step limit reached")
@@ -1296,6 +1450,8 @@ ShellRoot {
         if (screenClick.running) screenClick.signal(15)
         if (screenType.running) screenType.signal(15)
         if (screenOpen.running) screenOpen.signal(15)
+        if (windowPlan.running) windowPlan.signal(15)
+        if (windowRun.running) windowRun.signal(15)
         if (memoryRead.running) memoryRead.signal(15)
         if (memoryList.running) memoryList.signal(15)
         if (memoryWrite.running) memoryWrite.signal(15)
@@ -1390,6 +1546,36 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: windowPlan
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.windowPlanBuffer += line + "\n" }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 300)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishWindowPlan() }
+    }
+
+    Process {
+        id: windowRun
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.windowRunBuffer += line + "\n" }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 300)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishWindowRun(exitCode) }
     }
 
     Process {
