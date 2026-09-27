@@ -241,7 +241,6 @@ SUPPORTED = {"say", "open", "click", "type", "press", "wait", "ask"}
 # Accepted when a recipe is written, but not runnable yet.
 PENDING = {
     "command": "commands are not runnable yet",
-    "wait_for": "waiting for text on screen is not implemented yet",
 }
 
 

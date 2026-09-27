@@ -97,6 +97,7 @@ ShellRoot {
     property string recipePendingStep: ""
     property var recipePendingClick: null
     property int recipeLookupMessage: -1
+    property var recipePendingWait: null
     property int maxLooks: 3
     property string screenMonitor: "auto"
     property string settingsBuffer: ""
@@ -891,6 +892,13 @@ ShellRoot {
 
     function runSelfTestChecks() {
         var results = []
+        function recentText(count) {
+            var text = ""
+            var from = Math.max(0, messages.count - (count || 4))
+            for (var i = from; i < messages.count; i += 1) text += String(messages.get(i).text || "") + " "
+            return text
+        }
+
         function expect(name, actual, wanted, detail) {
             if (actual === wanted) {
                 results.push("PASS " + name)
@@ -1070,6 +1078,63 @@ ShellRoot {
         expect("a located click still needs approval", Boolean(root.proposedAction && root.proposedAction.requiresApproval), true)
         root.proposedAction = null
         root.recipeFinish("selftest cleanup")
+
+        // A wait_for answer is only ever yes, no, or neither. Neither must never
+        // be read as yes, or the recipe steps forward on a guess.
+        expect("yes is yes", root.recipeAnsweredYes("yes"), true)
+        expect("a sentence containing yes is yes", root.recipeAnsweredYes("Yes, the word is visible."), true)
+        expect("no is no", root.recipeAnsweredYes("no"), false)
+        expect("none is no", root.recipeAnsweredYes("none"), false)
+        expect("a refusal is no", root.recipeAnsweredYes("I cannot see it"), false)
+        expect("is not is no", root.recipeAnsweredYes("it is not there"), false)
+        expect("an empty answer is neither", root.recipeAnsweredYes(""), null)
+        expect("an unrelated answer is neither", root.recipeAnsweredYes("the screen is locked"), null)
+        expect("neither is not read as yes", root.recipeAnsweredYes("the screen is locked") === true, false)
+
+        // A wait that is already out of time gives up instead of probing again.
+        root.recipeActive = true
+        root.recipeTitle = "waitfail"
+        root.recipeSteps = [{ wait_for: "Downloading", timeout_seconds: 30 }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.proposedAction = null
+        root.recipePendingWait = { description: "Downloading", where: "step 1 of 1", deadline: Date.now() - 1000, limit: 30, attempts: 3 }
+        root.activeText = "no"
+        root.busy = true
+        var beforeWaitFail = messages.count
+        root.finishRecipeWait(0)
+        expect("an expired wait stops the recipe", root.recipeActive, false)
+        expect("an expired wait says what it gave up on", messages.count > beforeWaitFail, true)
+        expect("an expired wait explains the timeout", /did not appear within 30 seconds/.test(String(messages.get(messages.count - 1).text || "")), true, String(messages.get(messages.count - 1).text || ""))
+        expect("an expired wait leaves nothing pending", root.recipePendingWait, null)
+        expect("an expired wait does not leave the app busy", root.busy, false)
+
+        // Too many looks gives up even with time left on the clock.
+        root.recipeActive = true
+        root.recipeTitle = "waitmany"
+        root.recipeSteps = [{ wait_for: "Downloading", timeout_seconds: 900 }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.recipePendingWait = { description: "Downloading", where: "step 1 of 1", deadline: Date.now() + 600000, limit: 900, attempts: 20 }
+        root.activeText = "no"
+        root.busy = true
+        root.finishRecipeWait(0)
+        expect("too many looks stops the recipe", root.recipeActive, false)
+        expect("too many looks explains itself", /gave up checking/.test(String(messages.get(messages.count - 1).text || "")), true, String(messages.get(messages.count - 1).text || ""))
+
+        // A wait that is satisfied moves the recipe on.
+        root.recipeActive = true
+        root.recipeTitle = "waitok"
+        root.recipeSteps = [{ wait_for: "Downloading" }, { say: "after" }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.recipePendingWait = { description: "Downloading", where: "step 1 of 1", deadline: Date.now() + 60000, limit: 60, attempts: 1 }
+        root.activeText = "yes"
+        root.busy = true
+        root.finishRecipeWait(0)
+        expect("a satisfied wait moves the recipe on", root.recipeActive, false)
+        expect("a satisfied wait clears the wait", root.recipePendingWait, null)
+        expect("a satisfied wait says what it saw", /Found Downloading/.test(recentText(4)), true, recentText(4))
 
         // A second change in one turn is refused, and says so out loud.
         var before = messages.count
@@ -1308,6 +1373,12 @@ ShellRoot {
             appLookup.running = true
             return
         }
+        if (action === "wait_for") {
+            var limit = Math.max(1, Math.min(Number(step.timeout_seconds || 60), 3600))
+            root.recipePendingWait = { description: String(value), where: String(where), deadline: Date.now() + limit * 1000, limit: limit, attempts: 0 }
+            root.recipeProbeWait()
+            return
+        }
         if (action === "click") {
             if (!String(value || "").trim()) {
                 root.recipeFail("the click step does not say what to click")
@@ -1431,6 +1502,81 @@ ShellRoot {
             requiresApproval: true,
             risk: ""
         })
+        assistant.visible = true
+        Qt.callLater(function() { input.forceActiveFocus() })
+    }
+
+    // Kept separate from the click lookup: no assistant message is created for a
+    // probe, so a five-minute wait does not leave a trail of one-line replies. The
+    // status line says what it is waiting for, and the outcome is a single message.
+    function recipeProbeWait() {
+        var wait = root.recipePendingWait
+        if (!wait) return
+        wait.attempts += 1
+        root.activeMessage = -1
+        root.activeText = ""
+        root.activePartId = ""
+        root.activeSources = []
+        root.activeFiles = []
+        root.errorText = ""
+        var left = Math.max(0, Math.round((wait.deadline - Date.now()) / 1000))
+        root.statusText = root.recipeTitle + ": waiting for " + wait.description + " (" + left + "s left)"
+        root.pendingPrompt = "The attached screenshot is the user's screen right now. Is this true of it: " + wait.description + " Answer yes or no, and nothing else."
+        assistant.visible = false
+        screenCaptureDelay.interval = 100
+        screenCaptureDelay.restart()
+    }
+
+    // A refusal is a no, a missing answer is neither, and neither is ever read
+    // as success: continuing on an unknown answer would step forward on a guess.
+    function recipeAnsweredYes(text) {
+        var value = String(text || "").trim().toLowerCase()
+        if (!value) return null
+        if (/\b(no|not|none|never|cannot|can\'t|isn\'t|is not)\b/.test(value)) return false
+        if (/\b(yes|yeah|yep|correct|true|visible|shows|see|seen)\b/.test(value)) return true
+        return null
+    }
+
+    function finishRecipeWait(exitCode) {
+        var wait = root.recipePendingWait
+        if (root.screenAttached) {
+            root.cleanupScreen()
+            root.screenAttached = false
+        }
+        root.busy = false
+        root.activePartId = ""
+        if (!wait || !root.recipeActive) {
+            assistant.visible = true
+            Qt.callLater(function() { input.forceActiveFocus() })
+            return
+        }
+        var answer = exitCode === 0 ? root.recipeAnsweredYes(root.activeText) : null
+        if (answer === true) {
+            root.recipePendingWait = null
+            addMessage("assistant", "Found " + wait.description + ", so I am carrying on.")
+            root.recipeStepDone()
+            assistant.visible = true
+            Qt.callLater(function() { input.forceActiveFocus() })
+            return
+        }
+        var left = wait.deadline - Date.now()
+        if (left <= 0) {
+            root.recipePendingWait = null
+            root.recipeFail(wait.description + " did not appear within " + wait.limit + " seconds")
+            assistant.visible = true
+            Qt.callLater(function() { input.forceActiveFocus() })
+            return
+        }
+        if (wait.attempts >= 20) {
+            root.recipePendingWait = null
+            root.recipeFail("gave up checking for " + wait.description + " after " + wait.attempts + " looks over " + Math.round(wait.limit / 20) + " seconds apart")
+            assistant.visible = true
+            Qt.callLater(function() { input.forceActiveFocus() })
+            return
+        }
+        // Not yet. Wait a little, then look again.
+        recipeWait.interval = Math.max(2000, Math.min(Math.round(left / 20), 10000))
+        recipeWait.restart()
         assistant.visible = true
         Qt.callLater(function() { input.forceActiveFocus() })
     }
@@ -1972,6 +2118,11 @@ ShellRoot {
             root.errorText = ""
             if (root.continueAfterLook()) return
         }
+        // The turn that answers a recipe's "is this on screen yet" question.
+        if (root.recipePendingWait !== null) {
+            root.finishRecipeWait(exitCode)
+            return
+        }
         // The turn that answers a recipe's "where is this" question.
         if (root.recipePendingClick !== null) {
             if (exitCode === 0) root.finishRecipeLocate()
@@ -2368,7 +2519,11 @@ ShellRoot {
         id: recipeWait
         interval: 1000
         repeat: false
-        onTriggered: root.recipeStepDone()
+        onTriggered: {
+            // One timer, two jobs: finishing a plain wait, or looking again.
+            if (root.recipePendingWait !== null) root.recipeProbeWait()
+            else root.recipeStepDone()
+        }
     }
 
     Process {

@@ -256,10 +256,22 @@ or anything it cannot read as a position all **stop the recipe** rather than bei
 rounded into a click somewhere nearby. A wrong click is the one failure mode a recipe
 must not have.
 
-Steps that run today: `say`, `open`, `click`, `type`, `press`, `wait`, `ask`. Steps
-that are accepted in a recipe but **refuse to run** until they are built: `wait_for`
-(waiting for text to appear on screen) and `command`. A recipe containing either is
-refused up front, by name, rather than running part of the way and stopping.
+A `wait_for` step holds the recipe until something is true of the screen, such as
+"Downloading" appearing. The assistant looks, answers itself yes or no, and looks
+again after a pause — roughly every five seconds, capped at twenty looks, and never
+past the `timeout_seconds` you set. Only an explicit **yes** moves the recipe on: a
+"no", a refusal, or an answer it cannot read is treated as *not yet*, because
+stepping forward on a half-understood screen is how a recipe ends up acting on the
+wrong window. Two things give up and stop the recipe: reaching the timeout, which
+says what it was waiting for, and running out of looks.
+
+The status line shows the wait counting down, and the transcript gets one line when
+it gives up — not a message per look, so a five-minute wait stays readable.
+
+Steps that run today: `say`, `open`, `click`, `type`, `press`, `wait`, `wait_for`,
+`ask`. The only step that is accepted in a recipe but **refuses to run** is `command`,
+and a recipe containing one is refused up front, by name, rather than running part of
+the way and stopping.
 
 Two rules are enforced in the format rather than trusted to the draft. Commands run
 as an argument list and never through a shell, so a step containing `;`, `&&`, `|`
