@@ -4,6 +4,8 @@ set -euo pipefail
 
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-assistant"
 key_file="$config_dir/gemini.key"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+image_helper="$script_dir/assistant_image_local.py"
 
 pictures_root() {
     if [[ -n "${XDG_PICTURES_DIR:-}" ]]; then
@@ -46,6 +48,66 @@ store_key() {
     printf 'Saved Gemini API key to %s (mode 600).\n' "$key_file"
 }
 
+image_venv() {
+    printf '%s\n' "${ASSISTANT_IMAGE_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-assistant/image-venv}"
+}
+
+image_python() {
+    printf '%s\n' "${ASSISTANT_IMAGE_PYTHON:-$(image_venv)/bin/python}"
+}
+
+image_status() {
+    local python_bin model
+    python_bin="$(image_python)"
+    model="${ASSISTANT_IMAGE_LOCAL_MODEL:-stabilityai/sdxl-turbo}"
+    printf 'local_python=%s\n' "$python_bin"
+    if [[ ! -x "$python_bin" ]]; then
+        printf 'local_installed=no\n'
+        printf 'next_step=run bin/assistant-config setup-image-models\n'
+        return 0
+    fi
+    printf 'local_installed=yes\n'
+    printf 'local_model=%s\n' "$model"
+    "$python_bin" "$image_helper" doctor 2>/dev/null || printf 'doctor_failed=1\n'
+}
+
+setup_image_models() {
+    local prefetch=1 venv python_bin
+    for argument in "$@"; do
+        case "$argument" in
+            --no-prefetch) prefetch=0 ;;
+            *) printf 'Unknown option: %s\n' "$argument" >&2; exit 1 ;;
+        esac
+    done
+    venv="$(image_venv)"
+    python_bin="$(image_python)"
+    helper="$image_helper"
+    if [[ ! -x "$python_bin" ]]; then
+        printf 'Creating the local image environment in %s\n' "$venv"
+        mkdir -p "$(dirname "$venv")"
+        "${PYTHON:-python3}" -m venv "$venv" || {
+            printf 'Could not create the virtual environment.\n' >&2
+            exit 1
+        }
+    fi
+    printf 'Installing PyTorch and diffusers into %s\n' "$venv"
+    "$python_bin" -m pip install --upgrade pip >/dev/null
+    "$python_bin" -m pip install --upgrade torch diffusers transformers accelerate safetensors sentencepiece protobuf pillow || {
+        printf 'Dependency installation failed.\n' >&2
+        exit 1
+    }
+    "$python_bin" "$helper" selftest || exit 1
+    "$python_bin" "$helper" doctor || exit 1
+    if ((prefetch)); then
+        printf 'Downloading %s weights (this is a one-time download of several GB).\n' "${ASSISTANT_IMAGE_LOCAL_MODEL:-stabilityai/sdxl-turbo}"
+        "$python_bin" "$helper" prefetch || {
+            printf 'Weight download failed; run this command again to retry.\n' >&2
+            exit 1
+        }
+    fi
+    printf 'Local image backend ready. Pass backend local to generate_image, or set ASSISTANT_IMAGE_BACKEND=local.\n'
+}
+
 status() {
     local source="none"
     if [[ -n "${GEMINI_API_KEY:-}" ]]; then
@@ -56,6 +118,7 @@ status() {
     printf 'configured=%s\n' "$([[ "$source" == "none" ]] && printf 'no' || printf 'yes')"
     printf 'source=%s\n' "$source"
     printf 'model=%s\n' "${ASSISTANT_IMAGE_MODEL:-gemini-3-pro-image}"
+    printf 'preferred_backend=%s\n' "${ASSISTANT_IMAGE_BACKEND:-gemini}"
     printf 'output_dir=%s\n' "$(output_dir)"
     printf 'hourly_limit=%s\n' "${ASSISTANT_IMAGE_HOURLY_LIMIT:-10}"
     printf 'daily_limit=%s\n' "${ASSISTANT_IMAGE_DAILY_LIMIT:-60}"
@@ -65,11 +128,13 @@ usage() {
     cat <<'EOF'
 Usage: assistant-config <command>
 
-  status              Show whether image generation is configured (never prints the key)
-  set-key             Read a Gemini API key from stdin and store it with mode 600
-  set-key --from-env  Store the value of GEMINI_API_KEY from the environment
-  clear               Delete the stored Gemini API key
-  output-dir          Print the directory where generated images are saved
+  status                Show whether image generation is configured (never prints the key)
+  set-key               Read a Gemini API key from stdin and store it with mode 600
+  set-key --from-env    Store the value of GEMINI_API_KEY from the environment
+  clear                 Delete the stored Gemini API key
+  output-dir            Print the directory where generated images are saved
+  image-status          Report local backend, GPU, and cached weight status
+  setup-image-models    Install the local backend (venv, PyTorch, SDXL-Turbo weights)
 EOF
 }
 
@@ -102,6 +167,13 @@ case "${1:-status}" in
         ;;
     output-dir)
         output_dir
+        ;;
+    image-status)
+        image_status
+        ;;
+    setup-image-models)
+        shift || true
+        setup_image_models "$@"
         ;;
     help | -h | --help)
         usage

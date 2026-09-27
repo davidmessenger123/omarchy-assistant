@@ -18,7 +18,7 @@ if [[ ! -x "$script_dir/bin/screen_capture" ]]; then
     printf 'Missing bundled bin/screen_capture helper.\n' >&2
     exit 1
 fi
-chmod +x "$script_dir/run.sh" "$script_dir/screen_click.py" "$script_dir/assistant_memory.py" "$script_dir/assistant_update.py" "$script_dir/bin/assistant-config" "$script_dir/bin/screen_capture" "$script_dir/bin/screen_capture_secure"
+chmod +x "$script_dir/run.sh" "$script_dir/screen_click.py" "$script_dir/assistant_memory.py" "$script_dir/assistant_update.py" "$script_dir/assistant_image_local.py" "$script_dir/bin/assistant-config" "$script_dir/bin/screen_capture" "$script_dir/bin/screen_capture_secure"
 npm install --prefix "$script_dir/.opencode"
 printf 'Installed OpenCode tool dependencies.\n'
 printf 'Launch with: %s/run.sh\n' "$script_dir"

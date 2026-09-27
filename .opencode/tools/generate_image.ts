@@ -1,10 +1,16 @@
 import { tool } from "@opencode-ai/plugin"
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { spawn } from "node:child_process"
+import { access, chmod, copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
-const model = process.env.ASSISTANT_IMAGE_MODEL || "gemini-3-pro-image"
-const endpoint = (process.env.ASSISTANT_GEMINI_ENDPOINT || "https://generativelanguage.googleapis.com/v1beta").replace(/\/+$/, "")
+// Read per call rather than at import time so a restarted assistant, a test, or a
+// changed environment always sees the current settings.
+const geminiModel = () => process.env.ASSISTANT_IMAGE_MODEL || "gemini-3-pro-image"
+const geminiEndpoint = () => (process.env.ASSISTANT_GEMINI_ENDPOINT || "https://generativelanguage.googleapis.com/v1beta").replace(/\/+$/, "")
+const localModel = () => process.env.ASSISTANT_IMAGE_LOCAL_MODEL || "stabilityai/sdxl-turbo"
+const localPython = () => process.env.ASSISTANT_IMAGE_PYTHON || join(homedir(), ".local", "share", "omarchy-assistant", "image-venv", "bin", "python")
+const preferredBackend = () => String(process.env.ASSISTANT_IMAGE_BACKEND || "gemini").trim().toLowerCase()
 const aspectRatios = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
 const resolutions = ["1K", "2K", "4K"]
 const maxBytes = 64 * 1024 * 1024
@@ -89,12 +95,183 @@ function failure(error: string, extra: Record<string, unknown> = {}) {
     return JSON.stringify({ ok: false, action: "generate_image", error, ...extra })
 }
 
+async function saveImage(source: string, dir: string, name: string) {
+    const path = join(dir, name)
+    await mkdir(dir, { recursive: true, mode: 0o755 })
+    try {
+        await rename(source, path)
+    } catch {
+        await copyFile(source, path)
+        await unlink(source).catch(() => {})
+    }
+    // Locally generated files arrive from mkstemp with mode 0600; match the
+    // Gemini path so images are readable like any other picture.
+    await chmod(path, 0o644).catch(() => {})
+    return path
+}
+
+async function generateWithGemini(credential: { key: string }, prompt: string, aspectRatio: string, resolution: string, filenameHint: string) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), limit("ASSISTANT_IMAGE_TIMEOUT_MS", 300000))
+    let data: any = null
+    try {
+        const response = await fetch(`${geminiEndpoint()}/models/${geminiModel()}:generateContent`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-goog-api-key": credential.key },
+            body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                generationConfig: {
+                    responseModalities: ["TEXT", "IMAGE"],
+                    imageConfig: { aspectRatio, imageSize: resolution }
+                }
+            }),
+            signal: controller.signal
+        })
+        const raw = await response.text()
+        try {
+            data = JSON.parse(raw)
+        } catch {
+            data = null
+        }
+        if (!response.ok) {
+            const message = firstLine(data?.error?.message) || raw.slice(0, 300) || `HTTP ${response.status}`
+            return { ok: false, error: `Gemini rejected the image request: ${message}` }
+        }
+    } catch (error) {
+        const reason = error instanceof Error && error.name === "AbortError" ? "timed out" : error instanceof Error ? error.message : String(error)
+        return { ok: false, error: `Gemini image request failed: ${reason}` }
+    } finally {
+        clearTimeout(timer)
+    }
+
+    const candidates = Array.isArray(data?.candidates) ? data.candidates : []
+    const parts = Array.isArray(candidates[0]?.content?.parts) ? candidates[0].content.parts : []
+    let caption = ""
+    let inline: any = null
+    for (const part of parts) {
+        if (!caption && typeof part?.text === "string" && part.text.trim()) caption = part.text.trim()
+        if (!inline) inline = part?.inlineData || part?.inline_data || null
+    }
+    if (!inline || typeof inline.data !== "string" || !inline.data) {
+        const blockReason = firstLine(data?.promptFeedback?.blockReason)
+        if (blockReason) return { ok: false, error: `Gemini blocked this image request (${blockReason}). Try rephrasing the prompt.` }
+        const finishReason = firstLine(candidates[0]?.finishReason)
+        if (finishReason && finishReason !== "STOP") return { ok: false, error: `Gemini returned no image (${finishReason}). Try a different prompt.` }
+        return { ok: false, error: "Gemini returned no image data. Try a more descriptive prompt." }
+    }
+    const mime = firstLine(inline.mimeType || inline.mime_type)
+    const extension = extensions[mime.toLowerCase()]
+    if (!extension) return { ok: false, error: `Gemini returned an unsupported image type (${mime || "unknown"}).` }
+    if (inline.data.length > Math.ceil(maxBytes * 1.4)) return { ok: false, error: "The generated image is larger than the 64 MB limit." }
+
+    const dir = await outputDir()
+    const path = join(dir, `${slug(filenameHint || prompt)}-${stamp()}${extension}`)
+    try {
+        await mkdir(dir, { recursive: true, mode: 0o755 })
+        await writeFile(path, Buffer.from(inline.data, "base64"), { mode: 0o644 })
+    } catch (error) {
+        return { ok: false, error: `Could not save the generated image: ${error instanceof Error ? error.message : String(error)}` }
+    }
+    return {
+        ok: true,
+        backend: "gemini",
+        path,
+        mime,
+        bytes: Buffer.from(inline.data, "base64").length,
+        model: geminiModel(),
+        aspect_ratio: aspectRatio,
+        resolution,
+        caption: caption.slice(0, 800)
+    }
+}
+
+function runLocal(request: Record<string, unknown>, timeoutMs: number) {
+    return new Promise<{ stdout: string; stderr: string; code: number | null; error?: string }>((resolve) => {
+        const child = spawn(localPython(), [join(process.env.ASSISTANT_APP_DIR || process.cwd(), "assistant_image_local.py"), "generate"], {
+            stdio: ["pipe", "pipe", "pipe"]
+        })
+        let stdout = ""
+        let stderr = ""
+        let settled = false
+        const finish = (result: { stdout: string; stderr: string; code: number | null; error?: string }) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            resolve(result)
+        }
+        const timer = setTimeout(() => {
+            child.kill("SIGKILL")
+            finish({ stdout, stderr, code: null, error: `Local generation exceeded ${Math.round(timeoutMs / 1000)} seconds. The first run also downloads model weights, so it can be slow.` })
+        }, timeoutMs)
+        child.stdout.on("data", (chunk) => (stdout += chunk))
+        child.stderr.on("data", (chunk) => {
+            stderr = (stderr + chunk).slice(-2000)
+        })
+        child.on("error", (error) => finish({ stdout, stderr, code: null, error: error instanceof Error ? error.message : String(error) }))
+        child.on("close", (code) => finish({ stdout, stderr, code }))
+        child.stdin.on("error", () => {})
+        child.stdin.end(JSON.stringify(request))
+    })
+}
+
+async function generateLocally(prompt: string, aspectRatio: string, steps: number, filenameHint: string) {
+    const timeoutMs = limit("ASSISTANT_IMAGE_LOCAL_TIMEOUT_MS", 3600000)
+    const result = await runLocal({ prompt, aspect_ratio: aspectRatio, steps, model: localModel() }, timeoutMs)
+    if (result.error) return { ok: false, error: result.error }
+    // The helper prints one JSON object, but libraries can emit stray lines, so
+    // read the last line that parses as JSON rather than the whole stream.
+    let parsed: any = null
+    const lines = result.stdout.trim().split(/\r?\n/).reverse()
+    for (const line of lines) {
+        if (!line.trim().startsWith("{")) continue
+        try {
+            const candidate = JSON.parse(line)
+            if (candidate && typeof candidate === "object") {
+                parsed = candidate
+                break
+            }
+        } catch {}
+    }
+    if (!parsed) {
+        const message = result.stderr.trim().split(/\r?\n/).filter(Boolean).pop() || "Local generation returned no result."
+        return { ok: false, error: message }
+    }
+    if (parsed.ok !== true) {
+        return { ok: false, error: firstLine(parsed.error) || "Local generation failed." }
+    }
+    const dir = await outputDir()
+    const name = `${slug(filenameHint || prompt)}-${stamp()}.png`
+    try {
+        const path = await saveImage(parsed.path, dir, name)
+        return {
+            ok: true,
+            backend: "local",
+            path,
+            mime: parsed.mime || "image/png",
+            width: parsed.width,
+            height: parsed.height,
+            steps: parsed.steps,
+            seed: parsed.seed,
+            model: parsed.model,
+            device: parsed.device,
+            load_seconds: parsed.load_seconds,
+            generate_seconds: parsed.generate_seconds,
+            note: "Generated on this machine; the prompt never left it."
+        }
+    } catch (error) {
+        await unlink(parsed.path).catch(() => {})
+        return { ok: false, error: `Could not save the generated image: ${error instanceof Error ? error.message : String(error)}` }
+    }
+}
+
 export default tool({
-    description: "Generate an image from a text prompt with Google's Gemini image model and save it under the user's Pictures directory. Use this when the user asks to create, draw, generate, design, or make a picture, logo, illustration, poster, or photo. The tool returns the saved absolute path. It cannot edit an existing image and it never overwrites files.",
+    description: "Generate an image from a text prompt and save it under the user's Pictures directory. Two backends: 'gemini' calls Google's Gemini image model for the highest quality and best text-in-image, and 'local' runs SDXL-Turbo on the user's own GPU, which is private, offline, and free but lower quality and capped near 1024 pixels. Use 'auto' to let the app choose. Use this when the user asks to create, draw, generate, design, or make a picture, logo, illustration, poster, or photo. The tool returns the saved absolute path. It cannot edit an existing image and it never overwrites files.",
     args: {
         prompt: tool.schema.string().describe("Detailed description of the image to generate, including subject, style, composition, lighting, and any text that should appear."),
+        backend: tool.schema.string().describe("Backend: gemini, local, or auto. Defaults to the user's configured preference."),
         aspect_ratio: tool.schema.string().describe("Aspect ratio: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, or 21:9. Defaults to 1:1."),
-        resolution: tool.schema.string().describe("Output resolution: 1K, 2K, or 4K. Defaults to 1K. Use 2K or 4K only when the user asks for a high-resolution or large image."),
+        resolution: tool.schema.string().describe("Gemini only. Output resolution: 1K, 2K, or 4K. Defaults to 1K. Use 2K or 4K only when the user asks for a high-resolution image."),
+        steps: tool.schema.number().describe("Local backend only. Sampling steps from 1 to 4. Defaults to 2. Higher is slightly cleaner but slower."),
         filename: tool.schema.string().describe("Optional short words describing the image, used to build the saved filename.")
     },
     async execute(args) {
@@ -104,86 +281,39 @@ export default tool({
         if (!aspectRatios.includes(aspectRatio)) return failure(`Use one of these aspect ratios: ${aspectRatios.join(", ")}.`)
         const resolution = String(args.resolution || "1K").trim().toUpperCase()
         if (!resolutions.includes(resolution)) return failure(`Use one of these resolutions: ${resolutions.join(", ")}.`)
+        const requestedSteps = Number(args.steps)
+        const steps = Number.isFinite(requestedSteps) && requestedSteps > 0 ? Math.max(1, Math.min(Math.round(requestedSteps), 4)) : 2
+        const requested = String(args.backend || preferredBackend() || "gemini").trim().toLowerCase()
+        if (!["gemini", "local", "auto"].includes(requested)) return failure("Use backend gemini, local, or auto.")
 
         const credential = await resolveKey()
-        if (!credential.key) {
-            return failure("Image generation is not configured. Ask the user to run bin/assistant-config set-key in the assistant directory, or to export GEMINI_API_KEY, then try again.", { configured: false })
+        let localReady = true
+        try {
+            await access(localPython())
+        } catch {
+            localReady = false
         }
+        let backend = requested
+        if (backend === "auto") {
+            if (credential.key) backend = "gemini"
+            else if (localReady) backend = "local"
+            else {
+                return failure("Image generation is not configured. Either run bin/assistant-config set-key to add a Gemini API key, or bin/assistant-config setup-image-models to install the local model.", { configured: false })
+            }
+        }
+        if (backend === "local" && !localReady) {
+            return failure("The local image backend is not installed. Ask the user to run bin/assistant-config setup-image-models; the first run also downloads several GB of weights.", { configured: false })
+        }
+
         const limited = await recordAttempt()
         if (limited) return failure(limited)
 
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), limit("ASSISTANT_IMAGE_TIMEOUT_MS", 300000))
-        let data: any = null
-        try {
-            const response = await fetch(`${endpoint}/models/${model}:generateContent`, {
-                method: "POST",
-                headers: { "content-type": "application/json", "x-goog-api-key": credential.key },
-                body: JSON.stringify({
-                    contents: [{ role: "user", parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        responseModalities: ["TEXT", "IMAGE"],
-                        imageConfig: { aspectRatio, imageSize: resolution }
-                    }
-                }),
-                signal: controller.signal
-            })
-            const raw = await response.text()
-            try {
-                data = JSON.parse(raw)
-            } catch {
-                data = null
-            }
-            if (!response.ok) {
-                const message = firstLine(data?.error?.message) || raw.slice(0, 300) || `HTTP ${response.status}`
-                return failure(`Gemini rejected the image request: ${message}`)
-            }
-        } catch (error) {
-            const reason = error instanceof Error && error.name === "AbortError" ? "timed out" : error instanceof Error ? error.message : String(error)
-            return failure(`Gemini image request failed: ${reason}`)
-        } finally {
-            clearTimeout(timer)
+        if (backend === "local") return JSON.stringify(await generateLocally(prompt, aspectRatio, steps, String(args.filename || "").trim()))
+        if (!credential.key) {
+            return failure("Image generation is not configured. Ask the user to run bin/assistant-config set-key in the assistant directory, or to export GEMINI_API_KEY, then try again. The local backend is also available after bin/assistant-config setup-image-models.", { configured: false })
         }
-
-        const candidates = Array.isArray(data?.candidates) ? data.candidates : []
-        const parts = Array.isArray(candidates[0]?.content?.parts) ? candidates[0].content.parts : []
-        let caption = ""
-        let inline: any = null
-        for (const part of parts) {
-            if (!caption && typeof part?.text === "string" && part.text.trim()) caption = part.text.trim()
-            if (!inline) inline = part?.inlineData || part?.inline_data || null
-        }
-        if (!inline || typeof inline.data !== "string" || !inline.data) {
-            const blockReason = firstLine(data?.promptFeedback?.blockReason)
-            if (blockReason) return failure(`Gemini blocked this image request (${blockReason}). Try rephrasing the prompt.`)
-            const finishReason = firstLine(candidates[0]?.finishReason)
-            if (finishReason && finishReason !== "STOP") return failure(`Gemini returned no image (${finishReason}). Try a different prompt.`)
-            return failure("Gemini returned no image data. Try a more descriptive prompt.")
-        }
-        const mime = firstLine(inline.mimeType || inline.mime_type)
-        const extension = extensions[mime.toLowerCase()]
-        if (!extension) return failure(`Gemini returned an unsupported image type (${mime || "unknown"}).`)
-        if (inline.data.length > Math.ceil(maxBytes * 1.4)) return failure("The generated image is larger than the 64 MB limit.")
-
-        const dir = await outputDir()
-        const name = `${slug(firstLine(args.filename) || prompt)}-${stamp()}${extension}`
-        const path = join(dir, name)
-        try {
-            await mkdir(dir, { recursive: true, mode: 0o755 })
-            await writeFile(path, Buffer.from(inline.data, "base64"), { mode: 0o644 })
-        } catch (error) {
-            return failure(`Could not save the generated image: ${error instanceof Error ? error.message : String(error)}`)
-        }
-        return JSON.stringify({
-            ok: true,
-            action: "generate_image",
-            path,
-            mime,
-            bytes: Buffer.from(inline.data, "base64").length,
-            model,
-            aspect_ratio: aspectRatio,
-            resolution,
-            caption: caption.slice(0, 800)
-        })
+        const result = await generateWithGemini(credential, prompt, aspectRatio, resolution, String(args.filename || "").trim())
+        if (!result.ok) return failure(result.error as string, { backend: "gemini" })
+        return JSON.stringify({ action: "generate_image", ...result })
     }
 })

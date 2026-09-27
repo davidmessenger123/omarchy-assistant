@@ -8,7 +8,7 @@ A Quickshell desktop assistant for Omarchy/Hyprland. It uses OpenCode as its mod
 - iterative autonomous tasks that re-capture the screen after each action
 - first-use approval for each click/typing target, plus confirmation for sensitive actions
 - local memory for preferences, instructions, project context, personal facts, and conversation summaries
-- image generation through a dedicated Gemini image tool, with inline preview and one-click opening
+- image generation through Gemini and/or a local GPU model, with inline preview and one-click opening
 
 The assistant never edits files or runs arbitrary shell commands. Computer actions are executed by the local QML process only after the model proposes them and the safety checks pass.
 
@@ -45,23 +45,44 @@ For synthetic clicking, ensure the user can access `/dev/uinput` using the syste
 
 ## Image generation
 
-The chat model (Space Bunny) cannot create images, so the Assistant calls a dedicated `generate_image` tool that uses Google's Gemini image model (`gemini-3-pro-image`, Nano Banana Pro). Ask for an image in plain language, for example "draw a watercolour of a lighthouse at dusk in 16:9". The Assistant picks the aspect ratio, saves the file under `~/Pictures/omarchy-assistant/`, and shows the image inline with an **Open** button. This version generates new images only; it cannot edit an existing image.
+The chat model (Space Bunny) cannot create images, so the Assistant calls a dedicated `generate_image` tool. Ask for an image in plain language, for example "draw a watercolour of a lighthouse at dusk in 16:9". The Assistant picks the aspect ratio, saves the file under `~/Pictures/omarchy-assistant/`, and shows the image inline with an **Open** button. This version generates new images only; it cannot edit an existing image.
 
-Image generation needs your own Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey):
+Two backends are available, and the header button cycles between them (`Img: Gemini`, `Img: Local`, `Img: Auto`) while `ASSISTANT_IMAGE_BACKEND` sets the default:
+
+| Backend | Model | Cost | Privacy | Quality | Size |
+| --- | --- | --- | --- | --- | --- |
+| `gemini` | `gemini-3-pro-image` (Nano Banana Pro) | billed per image by Google | prompt sent to Google | best, strong text-in-image | up to 4K |
+| `local` | `stabilityai/sdxl-turbo` on your GPU | free | prompt never leaves the machine | good for drafts and stylised art | up to ~1024 px |
+
+### Gemini backend
+
+Needs your own Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey):
 
 ```bash
-# once per machine
 printf '%s' 'your-gemini-api-key' | ./bin/assistant-config set-key
 ./bin/assistant-config status
 ```
 
 The key is stored at `~/.config/omarchy-assistant/gemini.key` with mode `600`, is never written to the repository, and is never printed back. `GEMINI_API_KEY` in the environment works too and takes precedence. Use `./bin/assistant-config clear` to remove the stored key.
 
-Notes:
+### Local backend
 
-- Every image is a billable Gemini API call, and the prompt is sent to Google. Never include secrets or private data in an image prompt.
-- Generation is rate limited to 10 images per hour and 60 per day by default. Override with `ASSISTANT_IMAGE_HOURLY_LIMIT` and `ASSISTANT_IMAGE_DAILY_LIMIT`.
-- `ASSISTANT_IMAGE_MODEL`, `ASSISTANT_GEMINI_ENDPOINT`, `ASSISTANT_IMAGE_DIR`, and `ASSISTANT_IMAGE_TIMEOUT_MS` are available for advanced setups, such as an API-compatible proxy or a different Gemini model.
+Runs SDXL-Turbo on the NVIDIA GPU through a private virtual environment, so nothing is installed system-wide:
+
+```bash
+./bin/assistant-config setup-image-models   # venv, PyTorch, diffusers, then the weights
+./bin/assistant-config image-status          # GPU, torch, and cached-weight report
+```
+
+The first command creates `~/.local/share/omarchy-assistant/image-venv`, installs PyTorch and diffusers, and downloads the SDXL-Turbo weights (about 7 GB). The first generation also pays a one-time model load of several seconds. SDXL-Turbo needs about 6 GB of VRAM; smaller cards work because the weights stream from system RAM, and the helper automatically stays on the CPU when no CUDA GPU is visible.
+
+On a 6 GB laptop GPU expect roughly 1-3 seconds per 1024-pixel image after the model is loaded, and noticeably weaker results than Gemini for photorealism, precise composition, and any text inside the image. Use `local` for drafts, iterations, private subjects, and offline work; switch to `gemini` for the final image.
+
+### Notes
+
+- Every Gemini image is a billable API call, and the prompt is sent to Google. Never include secrets or private data in a Gemini image prompt.
+- Generation is rate limited to 10 images per hour and 60 per day across both backends. Override with `ASSISTANT_IMAGE_HOURLY_LIMIT` and `ASSISTANT_IMAGE_DAILY_LIMIT`.
+- `ASSISTANT_IMAGE_MODEL`, `ASSISTANT_GEMINI_ENDPOINT`, `ASSISTANT_IMAGE_DIR`, and `ASSISTANT_IMAGE_TIMEOUT_MS` tune the Gemini backend. `ASSISTANT_IMAGE_LOCAL_MODEL`, `ASSISTANT_IMAGE_PYTHON`, and `ASSISTANT_IMAGE_LOCAL_TIMEOUT_MS` tune the local backend, for example to point at a different Diffusers model or an API-compatible proxy.
 
 ## Updates
 

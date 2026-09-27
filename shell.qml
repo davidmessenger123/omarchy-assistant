@@ -50,6 +50,11 @@ ShellRoot {
     property string updateBuffer: ""
     property string updateCurrent: ""
     property string updateLatest: ""
+    property string imageBackend: {
+        var configured = String(Quickshell.env("ASSISTANT_IMAGE_BACKEND") || "gemini").trim().toLowerCase()
+        return ["gemini", "local", "auto"].indexOf(configured) !== -1 ? configured : "gemini"
+    }
+    readonly property string imageBackendPreference: "Image backend preference: " + root.imageBackend + ". Pass the backend argument to generate_image unless the user's request clearly calls for the other one."
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
     readonly property string appDir: root.filePath(Qt.resolvedUrl("."))
@@ -193,6 +198,11 @@ ShellRoot {
         var text = String(value || "").replace(/\/+$/, "")
         var parts = text.split("/")
         return parts.length > 0 && parts[parts.length - 1] ? parts[parts.length - 1] : text
+    }
+
+    function cycleImageBackend() {
+        root.imageBackend = root.imageBackend === "gemini" ? "local" : root.imageBackend === "local" ? "auto" : "gemini"
+        root.statusText = "Image backend: " + root.imageBackend
     }
 
     function isImagePath(value) {
@@ -400,6 +410,7 @@ ShellRoot {
     function startRequest(prompt, screenshotPath) {
         var context = ""
         if (root.memoryContext) context += root.memoryContext + "\n\n"
+        if (root.imageBackendPreference) context += root.imageBackendPreference + " "
         if (root.autonomyActive) {
             context += "Guarded autonomous task: " + root.autonomyTask + ". Use one action tool per turn when the task needs computer control. The desktop executes low-risk actions automatically, provides a fresh screenshot on the next turn, and asks the user to confirm sensitive actions and the first use of each click or typing target. Do not claim an action happened before its result is reported. "
             if (root.autonomyFeedback) context += root.autonomyFeedback + " "
@@ -1211,6 +1222,29 @@ ShellRoot {
                             radius: 10
                             color: root.memoryVisible ? "#2A2F44" : "#273247"
                             border.color: "#3A465B"
+                        }
+                    }
+
+                    Button {
+                        id: imageBackendButton
+                        text: root.imageBackend === "gemini" ? "Img: Gemini" : root.imageBackend === "local" ? "Img: Local" : "Img: Auto"
+                        onClicked: {
+                            root.cycleImageBackend()
+                            input.forceActiveFocus()
+                        }
+                        enabled: !root.busy && !root.clickBusy
+                        contentItem: Text {
+                            text: imageBackendButton.text
+                            color: imageBackendButton.enabled ? (root.imageBackend === "local" ? "#9FE0C0" : "#DCE5F2") : "#657083"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 10
+                            color: root.imageBackend === "local" ? "#1D3A38" : "#273247"
+                            border.color: root.imageBackend === "local" ? "#477D6C" : "#3A465B"
                         }
                     }
 
