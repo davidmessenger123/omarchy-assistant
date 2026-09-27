@@ -60,6 +60,7 @@ ShellRoot {
     property bool confirmImages: false
     property bool clipboardEnabled: false
     property bool remindersEnabled: true
+    property bool clipboardHistory: false
     property int maxLooks: 3
     property string screenMonitor: "auto"
     property string settingsBuffer: ""
@@ -251,6 +252,8 @@ ShellRoot {
         root.modelEscalate = String(parsed.model_escalate || "")
         root.confirmImages = parsed.confirm_images === true
         root.clipboardEnabled = parsed.clipboard_enabled === true
+        if (parsed.clipboard_history === true && !root.clipboardHistory) root.setClipboardHistory(true)
+        if (parsed.clipboard_history !== true && root.clipboardHistory) root.setClipboardHistory(false)
         root.remindersEnabled = parsed.reminders_enabled !== false
         var steps = parseInt(parsed.max_autonomy_steps, 10)
         if (isFinite(steps) && steps > 0) root.maxAutonomySteps = steps
@@ -896,6 +899,13 @@ ShellRoot {
         Qt.callLater(function() { input.forceActiveFocus() })
     }
 
+    function setClipboardHistory(enabled) {
+        if (enabled === root.clipboardHistory) return
+        root.clipboardHistory = enabled
+        clipboardHistory.command = ["/usr/bin/python3", root.appDir + "/assistant_clipboard_history.py", enabled ? "start" : "stop"]
+        clipboardHistory.running = true
+    }
+
     function runWindow(plan) {
         windowRun.command = ["/usr/bin/python3", root.appDir + "/assistant_windows.py", "run", JSON.stringify(plan)]
         windowRun.running = true
@@ -1092,8 +1102,8 @@ ShellRoot {
             } else if (tool === "glob" || tool === "grep" || tool === "list") {
                 root.statusText = "Searching files"
                 if (event.part.state) root.collectFiles(event.part.state.output, true)
-            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control") {
-                root.statusText = tool === "open_application" ? "Preparing application" : "Preparing action"
+            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control" || tool === "clipboard_history") {
+                root.statusText = tool === "open_application" ? "Preparing application" : tool === "clipboard_history" ? "Checking the clipboard history" : "Preparing action"
                 if (event.part.state) root.parseActionProposal(event.part.state.output)
             } else if (tool === "read_clipboard") {
                 root.statusText = "Reading the clipboard"
@@ -1546,6 +1556,19 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: clipboardHistory
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 200)
+            }
+        }
+        onExited: function(exitCode, exitStatus) {}
     }
 
     Process {

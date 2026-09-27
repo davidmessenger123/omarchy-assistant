@@ -36,6 +36,7 @@ SETTINGS: dict[str, tuple[object, str, type, str]] = {
     "image_local_timeout_ms": (3600000, "ASSISTANT_IMAGE_LOCAL_TIMEOUT_MS", int, "Local generation timeout in milliseconds"),
     "confirm_images": (False, "ASSISTANT_CONFIRM_IMAGES", bool, "Ask before generating a paid Gemini image"),
     "clipboard_enabled": (False, "ASSISTANT_CLIPBOARD", bool, "Allow the assistant to read the clipboard"),
+    "clipboard_history": (False, "ASSISTANT_CLIPBOARD_HISTORY", bool, "Record clipboard history so earlier copies can be found and pasted again"),
     "max_autonomy_steps": (8, "ASSISTANT_MAX_AUTONOMY_STEPS", int, "Maximum actions in one autonomous task"),
     "max_looks": (3, "ASSISTANT_MAX_LOOKS", int, "Model-requested screenshots allowed per user turn"),
     "screen_monitor": ("auto", "ASSISTANT_SCREEN_MONITOR", str, "Which monitor to capture: auto, cursor, focused, or a name"),

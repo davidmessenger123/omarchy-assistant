@@ -100,6 +100,20 @@ omarchy pkg add voxtype-bin
 
 If the tool is missing, the button says so instead of failing silently. `dictation_command` in settings points it at a different tool if you prefer.
 
+**Clipboard history** is a separate switch, also off by default, because it keeps
+what you copied rather than just reading the current clipboard:
+
+```bash
+./assistant_config.py set clipboard_history true
+```
+
+With it on, the assistant records what you copy, so "what did I copy a minute
+ago?", "find that link I copied", and "paste the third one back" all work. The
+store holds at most 200 entries for 24 hours, is written mode 0600, and never
+leaves the machine. `./assistant_clipboard_history.py status` says whether it is
+recording, and `clear` forgets everything. Pasting an entry goes through the same
+approval as any typing, and the history is never written to the action log.
+
 ## Window and workspace control
 
 The assistant can read your window list and arrange what is open, which is usually
