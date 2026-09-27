@@ -1629,6 +1629,7 @@ ShellRoot {
             color: "#151923"
             border.width: 1
             border.color: "#3A4355"
+            clip: true
 
             MouseArea {
                 anchors.fill: parent
@@ -1641,12 +1642,16 @@ ShellRoot {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    spacing: 10
+                    Layout.minimumWidth: 0
+                    spacing: 8
 
                     ColumnLayout {
                         Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         spacing: 2
                         Text {
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
                             text: "Omarchy Assistant"
                             color: "#F4F7FB"
                             font.family: "Sans Serif"
@@ -1654,7 +1659,9 @@ ShellRoot {
                             font.weight: Font.DemiBold
                         }
                         Text {
-                            text: "opencode/space-bunny-free"
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            text: root.turnModel || root.model
                             color: "#8F9AAF"
                             font.family: "Sans Serif"
                             font.pixelSize: 12
@@ -1827,7 +1834,7 @@ ShellRoot {
 
                     Button {
                         id: modelButton
-                        text: root.shortModel()
+                        text: "Model"
                         onClicked: {
                             root.toggleModelPanel()
                             input.forceActiveFocus()
@@ -2112,6 +2119,8 @@ ShellRoot {
                             }
 
                             Text {
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 0
                                 text: root.modelEscalate
                                     ? "Escalate uses " + root.modelEscalate
                                     : "Set model_escalate to enable Escalate"
@@ -2119,7 +2128,6 @@ ShellRoot {
                                 font.family: "Sans Serif"
                                 font.pixelSize: 10
                                 elide: Text.ElideRight
-                                Layout.maximumWidth: 260
                             }
 
                             Button {
@@ -2233,12 +2241,13 @@ ShellRoot {
                             }
 
                             Text {
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 0
                                 text: "Clicks, typing targets, images, and settings. Typed text is never stored."
                                 color: "#7C8AA0"
                                 font.family: "Sans Serif"
                                 font.pixelSize: 10
                                 elide: Text.ElideRight
-                                Layout.maximumWidth: 320
                             }
 
                             Button {
