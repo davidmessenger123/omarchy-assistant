@@ -39,6 +39,17 @@ function flag(settings: Settings, envName: string, key: string, fallback = false
 
 const ENABLE_HINT = "Clipboard history is turned off. The user can enable it with ./assistant_config.py set clipboard_history true, or by exporting ASSISTANT_CLIPBOARD_HISTORY=1."
 
+function helperError(error: unknown) {
+        const message = error instanceof Error ? error.message : String(error)
+        const stdout = (error as { stdout?: unknown })?.stdout
+        if (typeof stdout === "string" && stdout.trim().startsWith("{")) {
+            try {
+                return JSON.parse(stdout.trim())
+            } catch {}
+        }
+        return null
+    }
+
 async function helperCall(args: string[]) {
     // A helper that crashes must read as a clear message, not an exception the
     // model has to make sense of.
@@ -54,6 +65,8 @@ async function helperCall(args: string[]) {
         if (/ENOENT/.test(message)) {
             return { ok: false as const, error: "the clipboard history helper is missing from this installation" }
         }
+        const said = helperError(error)
+        if (said) return { ok: false as const, error: String(said.error || "the helper reported a problem"), problems: said.problems || [], data: said }
         return { ok: false as const, error: `the clipboard history could not be read: ${message.slice(0, 160)}` }
     }
 }

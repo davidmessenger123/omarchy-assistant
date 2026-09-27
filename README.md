@@ -205,6 +205,45 @@ ASSISTANT_SELFTEST=1 quickshell --path ./shell.qml   # prints SELFTEST PASS/FAIL
 It covers a change being proposed, the plan landing before or after the turn ends, a
 plan that fails, a check that never answers, and a second change in one turn.
 
+## Recipes: describe a procedure once, reuse it later
+
+A recipe is a named list of steps for something you would otherwise do by hand every
+time, like installing a game or messaging someone. You describe it in conversation,
+the assistant drafts it, and **you approve it before it is saved** — the card shows
+every step, with any command spelled out in full, in a monospaced face so nothing
+can be misread. Recipes live in `~/.config/omarchy-assistant/recipes` as JSON, mode
+0600, and each one records that the assistant wrote it and when.
+
+Steps available: `open`, `click`, `type`, `press`, `wait`, `wait_for`, `say`, `ask`,
+and `command`. Placeholders like `{{appid}}` are values you supply at run time, and
+the assistant will not guess a missing one.
+
+```json
+{
+  "name": "install-steam-game",
+  "title": "Install a Steam game",
+  "vars": ["appid"],
+  "steps": [
+    { "say": "Opening Steam" },
+    { "open": "steam" },
+    { "command": ["steam", "steam://install/{{appid}}"] },
+    { "ask": "Steam may ask for a purchase or a password. Do that yourself, then continue." },
+    { "wait_for": "Downloading", "timeout_seconds": 300 }
+  ]
+}
+```
+
+**Recipes cannot run yet.** This release covers describing, reviewing, saving, and
+dry-running them. `command` steps are accepted, saved, and shown, but nothing
+executes until the next stage, and the assistant is told to say so rather than
+improvise the steps itself.
+
+Two rules are enforced in the format rather than trusted to the draft. Commands run
+as an argument list and never through a shell, so a step containing `;`, `&&`, `|`
+or `$(` is rejected with an explanation instead of being quietly reinterpreted. And
+anything that spends money, accepts a licence, or needs a password is expected to be
+an `ask` step, so you do that part yourself and the assistant never sees it.
+
 ## Checking an installation
 
 ```bash

@@ -39,6 +39,17 @@ function flag(settings: Settings, envName: string, key: string, fallback = false
 
 const ENABLE_HINT = "Notification history is turned off. The user can enable it with ./assistant_config.py set notifications true, or by exporting ASSISTANT_NOTIFICATIONS=1."
 
+function helperError(error: unknown) {
+        const message = error instanceof Error ? error.message : String(error)
+        const stdout = (error as { stdout?: unknown })?.stdout
+        if (typeof stdout === "string" && stdout.trim().startsWith("{")) {
+            try {
+                return JSON.parse(stdout.trim())
+            } catch {}
+        }
+        return null
+    }
+
 async function helperCall(args: string[]) {
     try {
         const done = await run("/usr/bin/python3", [helper, ...args], { timeout: 20000, maxBuffer: 1024 * 1024 })
@@ -52,6 +63,8 @@ async function helperCall(args: string[]) {
         if (/ENOENT/.test(message)) {
             return { ok: false as const, error: "the notification history helper is missing from this installation" }
         }
+        const said = helperError(error)
+        if (said) return { ok: false as const, error: String(said.error || "the helper reported a problem"), problems: said.problems || [], data: said }
         return { ok: false as const, error: `the notification history could not be read: ${message.slice(0, 160)}` }
     }
 }

@@ -37,6 +37,9 @@ ShellRoot {
     // The only commands the model can ask for. A name that is not in here is
     // refused, so no command text ever reaches the shell from a tool.
     readonly property var notificationCommands: ({ "dismiss_notifications": ["dismiss"] })
+    // Recipes may run commands, so nothing here is ever built from model text
+    // beyond the JSON the user is shown and approves.
+    readonly property var recipeOperations: ({ save: "save", delete: "delete" })
     property string notificationRunBuffer: ""
     property string windowPlanBuffer: ""
     property string windowRunBuffer: ""
@@ -74,6 +77,7 @@ ShellRoot {
     property bool remindersEnabled: true
     property bool clipboardHistory: false
     property bool notificationHistory: false
+    property string recipeRunBuffer: ""
     property int maxLooks: 3
     property string screenMonitor: "auto"
     property string settingsBuffer: ""
@@ -746,6 +750,7 @@ ShellRoot {
         if (action.kind === "open_application") return "launch " + action.target
         if (action.kind === "window") return String(action.summary || "change the windows").toLowerCase()
         if (action.kind === "command") return String(action.summary || "run that command").toLowerCase()
+        if (action.kind === "recipe") return String(action.summary || "change the recipes").toLowerCase()
         return "click " + action.target
     }
 
@@ -755,6 +760,7 @@ ShellRoot {
         if (action.kind === "type") return "type|" + String(action.target || "").toLowerCase() + "|" + String(action.text || "")
         if (action.kind === "window") return "window|" + String(action.op || "") + "|" + String(action.target || "").toLowerCase()
         if (action.kind === "command") return "command|" + String(action.command || "")
+        if (action.kind === "recipe") return "recipe|" + String(action.operation || "") + "|" + String(action.recipe_name || "")
         return "open|" + String(action.application || action.target || "").toLowerCase()
     }
 
@@ -809,6 +815,25 @@ ShellRoot {
         } else if (proposal.action === "window") {
             root.planWindow(proposal)
             return
+        } else if (proposal.action === "recipe") {
+            var recipeOperation = String(proposal.operation || "")
+            if (!root.recipeOperations[recipeOperation]) return
+            var stepLines = []
+            var rawLines = proposal.lines
+            if (rawLines instanceof Array) {
+                for (var i = 0; i < rawLines.length && i < 40; i += 1) stepLines.push(String(rawLines[i]).slice(0, 200))
+            }
+            action = {
+                kind: "recipe",
+                operation: recipeOperation,
+                recipe: String(proposal.recipe || "{}").slice(0, 60000),
+                recipe_name: String(proposal.recipe_name || "").slice(0, 60),
+                target: String(proposal.summary || "that recipe").slice(0, 200),
+                summary: String(proposal.summary || "save that recipe"),
+                lines: stepLines,
+                requiresApproval: true,
+                risk: ""
+            }
         } else if (proposal.action === "command") {
             var commandName = String(proposal.command || "")
             if (!root.notificationCommands[commandName]) return
@@ -1044,6 +1069,53 @@ ShellRoot {
         Qt.callLater(function() { input.forceActiveFocus() })
     }
 
+    function runRecipe(plan) {
+        var operation = recipeOperations[String(plan.operation || "")]
+        if (!operation) {
+            root.clickBusy = false
+            addMessage("assistant", "That recipe operation is not one I can run.")
+            return
+        }
+        var command = ["/usr/bin/python3", root.appDir + "/assistant_recipes.py", operation]
+        if (operation === "save") command.push(String(plan.recipe || "{}"))
+        else command.push(String(plan.recipe_name || ""))
+        recipeRun.command = command
+        recipeRun.running = true
+    }
+
+    function finishRecipe(exitCode) {
+        if (recipeRun.running) return
+        var request = root.activeClick
+        var result = null
+        try {
+            result = JSON.parse(root.recipeRunBuffer.trim())
+        } catch (error) {
+            result = null
+        }
+        root.recipeRunBuffer = ""
+        root.activeClick = null
+        root.clickBusy = false
+        if (exitCode !== 0 || !result || result.ok !== true) {
+            var message = result && result.error ? String(result.error) : "it did not work"
+            var detail = result && result.problems ? " " + result.problems.join(" ") : ""
+            addMessage("assistant", "That did not work: " + message + "." + detail)
+            root.statusText = "Nothing saved"
+        } else {
+            root.statusText = "Recipe saved"
+            if (request && request.operation === "delete") {
+                root.logAction("file", "Deleted a recipe", String(request.recipe_name || ""))
+                addMessage("assistant", "Deleted the recipe.")
+            } else {
+                var summary = result.summary || {}
+                var detailText = String(summary.steps || 0) + " steps, " + String(summary.commands || 0) + " commands, " + String(summary.gates || 0) + " stops for you"
+                root.logAction("file", "Saved the recipe " + String(request.recipe_name || ""), detailText + ", written by " + String(summary.author || "assistant"))
+                addMessage("assistant", "Saved \"" + String(summary.title || request.recipe_name) + "\". Ask for it by name when you want it.")
+            }
+        }
+        assistant.visible = true
+        Qt.callLater(function() { input.forceActiveFocus() })
+    }
+
     function setNotificationHistory(enabled) {
         if (enabled === root.notificationHistory) return
         root.notificationHistory = enabled
@@ -1112,6 +1184,7 @@ ShellRoot {
         if (clipboardHistory.running) clipboardHistory.signal(15)
         if (notificationHistory.running) notificationHistory.signal(15)
         if (notificationRun.running) notificationRun.signal(15)
+        if (recipeRun.running) recipeRun.signal(15)
         root.activeClick = null
         root.clickBusy = false
         root.autonomyActive = false
@@ -1227,6 +1300,8 @@ ShellRoot {
             root.runWindow(request.plan || {})
         } else if (request.kind === "command") {
             root.runNotificationCommand(request.command)
+        } else if (request.kind === "recipe") {
+            root.runRecipe(request)
         } else {
             root.clickBusy = false
             root.stopAutonomy("Unsupported action")
@@ -1298,8 +1373,8 @@ ShellRoot {
             } else if (tool === "glob" || tool === "grep" || tool === "list") {
                 root.statusText = "Searching files"
                 if (event.part.state) root.collectFiles(event.part.state.output, true)
-            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control" || tool === "clipboard_history" || tool === "notifications") {
-                root.statusText = tool === "open_application" ? "Preparing application" : tool === "clipboard_history" ? "Checking the clipboard history" : tool === "notifications" ? "Checking notifications" : "Preparing action"
+            } else if (tool === "open_application" || tool === "click_screen" || tool === "screen_type" || tool === "type_text" || tool === "window_control" || tool === "clipboard_history" || tool === "notifications" || tool === "recipes") {
+                root.statusText = tool === "open_application" ? "Preparing application" : tool === "clipboard_history" ? "Checking the clipboard history" : tool === "notifications" ? "Checking notifications" : tool === "recipes" ? "Checking recipes" : "Preparing action"
                 if (event.part.state) root.parseActionProposal(event.part.state.output)
             } else if (tool === "read_clipboard") {
                 root.statusText = "Reading the clipboard"
@@ -1675,6 +1750,7 @@ ShellRoot {
         if (clipboardHistory.running) clipboardHistory.signal(15)
         if (notificationHistory.running) notificationHistory.signal(15)
         if (notificationRun.running) notificationRun.signal(15)
+        if (recipeRun.running) recipeRun.signal(15)
         if (memoryRead.running) memoryRead.signal(15)
         if (memoryList.running) memoryList.signal(15)
         if (memoryWrite.running) memoryWrite.signal(15)
@@ -1797,6 +1873,21 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) {}
+    }
+
+    Process {
+        id: recipeRun
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.recipeRunBuffer += line + "\n" }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 300)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishRecipe(exitCode) }
     }
 
     Process {
@@ -3105,6 +3196,26 @@ ShellRoot {
                                 font.family: "Sans Serif"
                                 font.pixelSize: 10
                                 elide: Text.ElideRight
+                            }
+                            // A recipe can run commands, so the user approves the
+                            // actual lines rather than a summary of them.
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.topMargin: 4
+                                spacing: 1
+                                visible: root.pendingClick !== null && root.pendingClick.kind === "recipe" && root.pendingClick.lines.length > 0
+                                Repeater {
+                                    model: root.pendingClick !== null && root.pendingClick.kind === "recipe" ? root.pendingClick.lines : []
+                                    delegate: Text {
+                                        required property string modelData
+                                        Layout.fillWidth: true
+                                        text: modelData
+                                        color: modelData.indexOf("run: ") === 2 ? "#FFC9A0" : modelData.indexOf("STOP AND ASK") !== -1 ? "#9FE0C0" : "#B9CBD6"
+                                        font.family: "Monospace"
+                                        font.pixelSize: 10
+                                        wrapMode: Text.Wrap
+                                    }
+                                }
                             }
                         }
 
