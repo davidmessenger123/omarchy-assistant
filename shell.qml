@@ -67,6 +67,13 @@ ShellRoot {
     property bool clearHistoryArmed: false
     property string historyBuffer: ""
     property var pendingImage: null
+    property string attachedImage: ""
+    property string attachBuffer: ""
+    property string lastImage: ""
+    property bool lastImagePending: false
+    property string pendingSendPrompt: ""
+    property var pendingLook: null
+    property int looksUsed: 0
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
     readonly property string appDir: root.filePath(Qt.resolvedUrl("."))
@@ -535,6 +542,25 @@ ShellRoot {
         updateRestartDelay.restart()
     }
 
+    // Files to send with the turn: an optional screenshot plus any attachments.
+    function attachmentList(screenshotPath) {
+        var files = []
+        if (screenshotPath) files.push(screenshotPath)
+        if (root.attachedImage) files.push(root.attachedImage)
+        if (root.lastImagePending) files.push(root.lastImage)
+        return files
+    }
+
+    function buildModelCommand(prompt, files) {
+        var args = [root.opencodeBin, "run", "--model", root.model, "--format", "json", "--pure", "--dir", root.appDir, "--agent", "chatbot", "--title", "Omarchy Assistant"]
+        if (root.sessionId) args.push("--session", root.sessionId)
+        for (var i = 0; i < files.length; i++) args.push("--file", files[i])
+        args.push("--", prompt)
+        // "$@" keeps the argument list intact, so prompts with spaces or quotes
+        // never pass through a shell.
+        return ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$1\"; shift; exec \"$@\" </dev/null", "assistant", root.appDir].concat(args)
+    }
+
     function startRequest(prompt, screenshotPath) {
         var context = ""
         if (root.memoryContext) context += root.memoryContext + "\n\n"
@@ -550,19 +576,11 @@ ShellRoot {
         root.screenAttached = screenshotPath !== ""
         root.busy = true
         root.statusText = screenshotPath ? "Reading screen" : "Thinking"
-        var command
-        if (screenshotPath) {
-            if (root.sessionId) {
-                command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$7\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --session \"$4\" --file \"$5\" -- \"$6\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", root.sessionId, screenshotPath, modelPrompt, root.model]
-            } else {
-                command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$6\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --file \"$4\" -- \"$5\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", screenshotPath, modelPrompt, root.model]
-            }
-        } else if (root.sessionId) {
-            command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$6\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" --session \"$4\" \"$5\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", root.sessionId, modelPrompt, root.model]
-        } else {
-            command = ["/bin/sh", "-c", "export ASSISTANT_APP_DIR=\"$2\"; exec \"$1\" run --model \"$5\" --format json --pure --dir \"$2\" --agent chatbot --title \"$3\" \"$4\" </dev/null", "assistant", root.opencodeBin, root.appDir, "Omarchy Assistant", modelPrompt, root.model]
-        }
-        opencode.command = command
+        opencode.command = root.buildModelCommand(modelPrompt, root.attachmentList(screenshotPath))
+        // One-shot attachments are consumed by this turn, now that the command
+        // that references them exists.
+        root.attachedImage = ""
+        root.lastImagePending = false
         opencode.running = true
         Qt.callLater(function() { input.forceActiveFocus() })
     }
@@ -748,6 +766,35 @@ ShellRoot {
         root.stopAutonomy("Autonomous task cancelled")
     }
 
+    function requestLook(request) {
+        if (root.pendingLook !== null) return
+        if (root.looksUsed >= root.maxLooks) {
+            root.lookLimitReached = true
+            return
+        }
+        root.pendingLook = { reason: String(request.reason || ""), target: String(request.target || "") }
+    }
+
+    function continueAfterLook() {
+        var look = root.pendingLook
+        root.pendingLook = null
+        if (!look) return false
+        root.looksUsed += 1
+        var remaining = root.maxLooks - root.looksUsed
+        var prompt = "You asked to see the screen"
+        if (look.target) prompt += " (" + look.target + ")"
+        prompt += ": " + look.reason + ". The screenshot is attached to this message. Continue with the user's original request: " + (root.currentUserPrompt || "the request above") + "."
+        if (remaining <= 0) prompt += " You have no screenshot requests left for this request, so work from what you can see and say what you still need."
+        root.logAction("look", "Captured the screen at the assistant's request", look.reason.slice(0, 100))
+        // Reuse the capture path: it stores the shot and starts the next turn.
+        root.pendingPrompt = prompt
+        root.statusText = "Looking at the screen"
+        assistant.visible = false
+        screenCaptureDelay.interval = 100
+        screenCaptureDelay.restart()
+        return true
+    }
+
     function runClick() {
         var request = root.activeClick
         if (!request) {
@@ -852,9 +899,24 @@ ShellRoot {
                         root.pendingImage = { request: proposal.request }
                         root.statusText = "Waiting for image approval"
                     } else if (proposal && proposal.ok === true) {
+                        if (proposal.path) {
+                            root.lastImage = String(proposal.path)
+                            root.lastImagePending = true
+                        }
                         var seconds = proposal.generate_seconds ? " in " + proposal.generate_seconds + "s" : ""
                         root.logAction("image", "Generated an image with " + String(proposal.backend || "the image backend") + (proposal.approved ? " after approval" : ""), String(proposal.width || "") + "x" + String(proposal.height || "") + (proposal.resolution ? " " + proposal.resolution : "") + seconds)
                     }
+                }
+            } else if (tool === "look_at") {
+                root.statusText = "Looking at the screen"
+                if (event.part.state) {
+                    var look = null
+                    try {
+                        look = JSON.parse(String(event.part.state.output || "").trim())
+                    } catch (error) {
+                        look = null
+                    }
+                    if (look && look.ok === true) root.requestLook(look)
                 }
             } else if (tool === "memory") {
                 root.statusText = "Updating memory"
@@ -886,6 +948,15 @@ ShellRoot {
     }
 
     function finishRequest(exitCode) {
+        if (root.pendingLook !== null && exitCode === 0) {
+            root.activeMessage = addMessage("assistant", "")
+            root.activeText = ""
+            root.activePartId = ""
+            root.activeSources = []
+            root.activeFiles = []
+            root.errorText = ""
+            if (root.continueAfterLook()) return
+        }
         var action = root.proposedAction
         root.proposedAction = null
         if (exitCode !== 0) {
@@ -933,14 +1004,88 @@ ShellRoot {
         Qt.callLater(function() { input.forceActiveFocus() })
     }
 
+    function imagePathsIn(text) {
+        var matches = String(text || "").match(/\/home\/[^\s<>"'`)]+\.(?:png|jpe?g|webp|gif|bmp)/gi)
+        return matches ? matches.slice(0, 3) : []
+    }
+
     function send() {
         if (root.busy || root.clickBusy) return
         var prompt = String(input.text || "").trim()
+        if (!prompt) return
+        if (root.attachedImage) {
+            root.pendingSendPrompt = prompt
+            root.finishSend()
+            return
+        }
+        var candidates = root.imagePathsIn(prompt)
+        if (candidates.length > 0 && !attachResolve.running) {
+            // Let the helper confirm the path is a readable image under /home
+            // before the model is asked to look at it.
+            root.pendingSendPrompt = prompt
+            root.attachBuffer = ""
+            attachResolve.command = ["/usr/bin/python3", root.appDir + "/assistant_attach.py", "resolve", candidates[0]]
+            attachResolve.running = true
+            root.statusText = "Checking the image"
+            return
+        }
+        root.pendingSendPrompt = prompt
+        root.finishSend()
+    }
+
+    function finishAttachResolve() {
+        var parsed = null
+        try {
+            parsed = JSON.parse(root.attachBuffer.trim())
+        } catch (error) {
+            parsed = null
+        }
+        root.attachBuffer = ""
+        if (parsed && parsed.ok === true) {
+            root.attachedImage = String(parsed.path)
+            root.logAction("file", "Attached an image", String(parsed.path))
+        }
+        root.finishSend()
+    }
+
+    function attachClipboardImage() {
+        if (root.busy || attachClipboard.running) return
+        root.attachBuffer = ""
+        attachClipboard.command = ["/usr/bin/python3", root.appDir + "/assistant_attach.py", "clipboard", Quickshell.statePath("assistant-clipboard.png")]
+        attachClipboard.running = true
+        root.statusText = "Reading the clipboard"
+    }
+
+    function finishAttachClipboard() {
+        var parsed = null
+        try {
+            parsed = JSON.parse(root.attachBuffer.trim())
+        } catch (error) {
+            parsed = null
+        }
+        root.attachBuffer = ""
+        if (parsed && parsed.ok === true) {
+            root.attachedImage = String(parsed.path)
+            root.logAction("clipboard", "Attached an image from the clipboard", String(parsed.path))
+            root.statusText = "Image attached"
+        } else {
+            root.statusText = parsed && parsed.error ? String(parsed.error).slice(0, 120) : "No image on the clipboard"
+        }
+    }
+
+    function finishSend() {
+        var contextNote = ""
+        var prompt = root.pendingSendPrompt
+        root.pendingSendPrompt = ""
         if (!prompt) return
         if (root.pendingClick !== null) root.cancelClick()
         root.proposedAction = null
         root.errorText = ""
         root.currentUserPrompt = prompt
+        if (root.lastImagePending) {
+            root.lastImagePending = false
+            contextNote = "The image you generated in the previous message is attached, so you can see it and iterate on it."
+        }
         root.autonomyActive = root.isAutonomyPrompt(prompt)
         if (root.autonomyActive) root.sessionId = ""
         root.autonomyTask = prompt
@@ -948,6 +1093,7 @@ ShellRoot {
         root.autonomyStep = 0
         root.autonomyFeedback = ""
         root.approvedTargets = []
+        root.looksUsed = 0
         input.text = ""
         addMessage("user", prompt)
         root.activeMessage = addMessage("assistant", "")
@@ -956,16 +1102,18 @@ ShellRoot {
         root.activeSources = []
         root.activeFiles = []
         root.busy = true
-        var useScreen = root.forceScreen || root.isActionPrompt(prompt)
+        // An explicit attachment is the visual context the user meant, so do not
+        // also grab the screen when one is attached.
+        var useScreen = !root.attachedImage && !root.lastImagePending && (root.forceScreen || root.isActionPrompt(prompt))
         root.forceScreen = false
         if (useScreen) {
-            root.pendingPrompt = prompt
+            root.pendingPrompt = contextNote ? contextNote + "\n\n" + prompt : prompt
             screenCaptureDelay.interval = 200
             root.statusText = "Reading screen"
             assistant.visible = false
             screenCaptureDelay.restart()
         } else {
-            root.requestModel(prompt, "")
+            root.requestModel(contextNote ? contextNote + "\n\n" + prompt : prompt, "")
         }
     }
 
@@ -987,6 +1135,11 @@ ShellRoot {
         root.autonomyStep = 0
         root.approvedTargets = []
         root.currentUserPrompt = ""
+        root.attachedImage = ""
+        root.lastImage = ""
+        root.lastImagePending = false
+        root.looksUsed = 0
+        root.pendingLook = null
         root.clearArmed = false
         root.errorText = ""
         root.statusText = "Ready"
@@ -1010,6 +1163,8 @@ ShellRoot {
         if (memoryWrite.running) memoryWrite.signal(15)
         if (updateCheck.running) updateCheck.signal(15)
         if (updateApply.running) updateApply.signal(15)
+        if (attachResolve.running) attachResolve.signal(15)
+        if (attachClipboard.running) attachClipboard.signal(15)
         updateRestartDelay.stop()
         if (opencode.running) opencode.signal(15)
         root.pendingClick = null
@@ -1095,6 +1250,31 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: attachResolve
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.attachBuffer += line }
+        }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) { root.finishAttachResolve() }
+    }
+
+    Process {
+        id: attachClipboard
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.attachBuffer += line }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 200)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishAttachClipboard() }
     }
 
     Process {
@@ -2202,6 +2382,52 @@ ShellRoot {
                     }
                 }
 
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: root.attachedImage !== "" ? 30 : 0
+                    visible: root.attachedImage !== ""
+                    radius: 8
+                    color: "#1B2A38"
+                    border.width: 1
+                    border.color: "#3A5A6E"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 8
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Attached: " + root.fileLabel(root.attachedImage)
+                            color: "#DCF3E7"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                        }
+
+                        Button {
+                            text: "Remove"
+                            onClicked: {
+                                root.attachedImage = ""
+                                input.forceActiveFocus()
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: "#DCE5F2"
+                                font.family: "Sans Serif"
+                                font.pixelSize: 11
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 8
+                                color: "#273247"
+                            }
+                        }
+                    }
+                }
+
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
@@ -2225,6 +2451,29 @@ ShellRoot {
                         }
                         onAccepted: root.send()
                         Keys.onEscapePressed: root.closeAssistant()
+                    }
+
+                    Button {
+                        id: attachButton
+                        text: "Attach"
+                        enabled: !root.busy && !root.clickBusy && !attachClipboard.running
+                        onClicked: {
+                            root.attachClipboardImage()
+                            input.forceActiveFocus()
+                        }
+                        contentItem: Text {
+                            text: attachButton.text
+                            color: attachButton.enabled ? "#DCE5F2" : "#657083"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 12
+                            color: "#273247"
+                            border.color: "#3A465B"
+                        }
                     }
 
                     Button {

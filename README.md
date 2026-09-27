@@ -88,6 +88,18 @@ Keys cover the chat model and the optional escalate model, the image backend, bo
 
 It verifies required commands, `/dev/uinput` access, venv support, the settings file, the Hyprland config and keybinding, the git checkout and whether it is behind `origin`, the OpenCode install and model list, the Gemini key (without printing it), the local image backend including GPU runtime and cached weights, free disk space, and that screen capture actually works. It changes nothing and exits non-zero if any check fails.
 
+## Seeing the screen and images
+
+**The assistant can ask to look at your screen.** When it needs something it cannot infer, such as an error message or what a dialog says, it calls `look_at` and stops. The app captures the screen and sends it back with the next turn, so the answer is based on what is actually on screen. Because OpenCode runs one turn at a time, the screenshot always arrives in a follow-up message rather than mid-answer. The number of screenshots per request is capped by `max_looks` (default 3), and the status line shows when the app is looking.
+
+The **Screen** button forces a screenshot for the next message, and the app attaches one automatically when a request obviously needs it.
+
+**You can attach images.** The **Attach** button takes an image from your Wayland clipboard and shows it as a chip with a **Remove** button. Mentioning a path also works: if your message contains something like `/home/you/Pictures/photo.png`, the app verifies it is a readable image under `/home` and attaches it automatically. An attached image is the visual context for that turn, so no screenshot is taken as well.
+
+**Generated images can be iterated on.** After the assistant generates an image, the next message you send attaches that image automatically, so "make it darker" or "add rain" works: the model sees what it made, changes it, and can tell you what changed between the two.
+
+Images are only read from paths under your home directory, are limited to 32 MB, and must be a format the model can read. Nothing is copied anywhere else.
+
 ## Action history
 
 The **History** button shows what the assistant actually did: clicks with their position and target, typing targets, launched applications, generated images, opened files, screen captures, setting changes, and task starts and stops. It is stored locally at:
