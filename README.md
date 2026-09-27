@@ -80,6 +80,36 @@ Behaviour lives in `~/.config/omarchy-assistant/config.json`, created automatica
 
 Keys cover the chat model and the optional escalate model, the image backend, both image model ids, the image directory, rate limits, timeouts, `confirm_images`, `clipboard_enabled`, `max_autonomy_steps`, `max_looks`, `screen_monitor`, `reminders_enabled`, `dictation_command`, and `keybind_combo`. A file that is not valid JSON is reported and ignored rather than breaking the app.
 
+## Reminders, clipboard, and dictation
+
+**Reminders** use Omarchy's own notifier, so they fire as a desktop notification even when the assistant is closed. Ask in plain language: "remind me in 20 minutes to check the oven". The assistant can also list and clear pending reminders. Times are limited to 1 to 1440 minutes, and it will set at most 6 reminders an hour so it cannot spam you. Turn it off with `reminders_enabled`.
+
+**Clipboard reading is off by default**, because the clipboard usually holds whatever you last copied, including passwords from a password manager. Enable it when you want it:
+
+```bash
+./assistant_config.py set clipboard_enabled true
+```
+
+With it enabled, "what did I just copy?" works. The assistant is told never to store clipboard contents in memory, never repeat a secret in full, and never type clipboard contents into a field. If the clipboard holds an image rather than text, it points you at the **Attach** button instead. Reading is capped at 8000 characters.
+
+**Dictation** uses a push-to-talk tool that types into the assistant's input, and is started from the **Mic** button. It needs [voxtype](https://github.com/omarchy-dono/voxtype), which is not installed by default:
+
+```bash
+omarchy pkg add voxtype-bin
+```
+
+If the tool is missing, the button says so instead of failing silently. `dictation_command` in settings points it at a different tool if you prefer.
+
+## Choosing which monitor is captured
+
+`screen_monitor` decides what the assistant sees when it looks at your screen:
+
+- `auto` (default) uses the monitor under your pointer, so it captures what you are looking at, and falls back to the focused monitor.
+- `focused` always uses the monitor with the focused window.
+- A monitor name such as `DP-7` pins it to that output.
+
+The chosen monitor is written next to the capture as a `.monitor` sidecar, which is also how synthetic clicks are mapped back to the right screen. On multi-monitor setups the other outputs are briefly disabled during the capture to avoid a Hyprland screencopy stall, then restored.
+
 ## Checking an installation
 
 ```bash

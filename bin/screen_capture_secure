@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
+# Capture the screen for the assistant, on the monitor the user is looking at.
+#
+# Usage: screen_capture_secure <output.png> [auto|cursor|focused|<monitor name>]
+#
+#   auto     the monitor under the pointer, falling back to the focused monitor
+#   cursor   the monitor under the pointer
+#   focused  the monitor with the focused window
+#   NAME     that monitor, for example DP-7
+#
+# Hyprland's screencopy path can stall when more than one output is active, so
+# the other outputs are disabled for the capture and restored afterwards. Every
+# capture is bounded by ASSISTANT_CAPTURE_TIMEOUT (default 20 seconds) and fails
+# loudly instead of hanging the caller.
 set -euo pipefail
+
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 output="${1:?output path required}"
-# Hyprland's screencopy path can wedge on some multi-monitor setups, so every
-# capture is bounded and fails loudly instead of hanging the caller.
+mode="${2:-auto}"
 capture_timeout="${ASSISTANT_CAPTURE_TIMEOUT:-20}"
 if ! [[ "$capture_timeout" =~ ^[0-9]+$ ]] || ((capture_timeout < 1)); then
     capture_timeout=20
 fi
+
 run_capture() {
     if command -v timeout >/dev/null 2>&1; then
         timeout "$capture_timeout" "$@"
@@ -15,18 +29,84 @@ run_capture() {
         "$@"
     fi
 }
+
 mapfile -t active_monitors < <(/usr/bin/hyprctl monitors -j | /usr/bin/python3 -c 'import json,sys; data=json.load(sys.stdin); print("\n".join(item.get("name", "") for item in data if item.get("name") and not item.get("disabled")))')
-focused_monitor="$(/usr/bin/hyprctl monitors -j | /usr/bin/python3 -c 'import json,sys; data=json.load(sys.stdin); print(next((item.get("name", "") for item in data if item.get("focused") and not item.get("disabled")), ""))')"
-if [[ -z "$focused_monitor" && ${#active_monitors[@]} -gt 0 ]]; then
-    focused_monitor="${active_monitors[0]}"
+
+# Choose the monitor: by name, by pointer position, or by focus.
+choose_monitor() {
+    /usr/bin/python3 - "$mode" <<'PY'
+import json
+import subprocess
+import sys
+
+mode = (sys.argv[1] if len(sys.argv) > 1 else "auto").strip().lower()
+
+
+def monitors():
+    try:
+        raw = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=10, check=False).stdout
+        return [item for item in json.loads(raw) if item.get("name") and not item.get("disabled")]
+    except Exception:
+        return []
+
+
+def focused(items):
+    for item in items:
+        if item.get("focused"):
+            return item["name"]
+    return ""
+
+
+def under_cursor(items):
+    try:
+        raw = subprocess.run(["hyprctl", "-j", "cursorpos"], capture_output=True, text=True, timeout=10, check=False).stdout
+        point = json.loads(raw)
+        x, y = float(point["x"]), float(point["y"])
+    except Exception:
+        return ""
+    for item in items:
+        left, top = float(item.get("x", 0)), float(item.get("y", 0))
+        width, height = float(item.get("width", 0)), float(item.get("height", 0))
+        if left <= x < left + width and top <= y < top + height:
+            return item["name"]
+    return ""
+
+
+items = monitors()
+names = [item["name"] for item in items]
+
+if mode in ("", "auto", "cursor"):
+    chosen = under_cursor(items)
+    if not chosen and mode == "cursor":
+        chosen = ""
+    if not chosen:
+        chosen = focused(items)
+elif mode == "focused":
+    chosen = focused(items)
+else:
+    chosen = mode if mode in names else ""
+
+if not chosen and names:
+    # Last resort so a capture never fails purely because of monitor bookkeeping.
+    chosen = names[0]
+print(chosen)
+PY
+}
+
+focused_monitor="$(choose_monitor)"
+if [[ -z "$focused_monitor" ]]; then
+    printf 'Could not work out which monitor to capture.\n' >&2
+    exit 1
 fi
+
+disabled_outputs=()
 restore_outputs() {
     for name in "${disabled_outputs[@]}"; do
         /usr/bin/hyprctl output "$name" enable >/dev/null 2>&1 || true
     done
 }
-disabled_outputs=()
-if [[ ${#active_monitors[@]} -gt 1 && -n "$focused_monitor" ]]; then
+
+if [[ ${#active_monitors[@]} -gt 1 ]]; then
     trap restore_outputs EXIT INT TERM
     for name in "${active_monitors[@]}"; do
         if [[ "$name" != "$focused_monitor" ]]; then
@@ -41,10 +121,11 @@ if [[ ${#active_monitors[@]} -gt 1 && -n "$focused_monitor" ]]; then
         exit 1
     fi
 else
-    if ! run_capture "$script_dir/screen_capture" "$output"; then
+    if ! run_capture "$script_dir/screen_capture" -o "$focused_monitor" "$output"; then
         printf 'Screen capture did not finish within %s seconds. Hyprland screencopy can stall; retrying usually helps, and restarting Hyprland clears it.\n' "$capture_timeout" >&2
         exit 1
     fi
 fi
-printf '%s\n' "$focused_monitor" > "$output.monitor"
+
+printf '%s\n' "$focused_monitor" >"$output.monitor"
 chmod 600 "$output" "$output.monitor"

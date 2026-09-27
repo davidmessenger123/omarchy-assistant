@@ -78,6 +78,7 @@ ShellRoot {
     property string modelListBuffer: ""
     property string turnModel: ""
     property string lastUserPrompt: ""
+    property string dictationBuffer: ""
     property int looksUsed: 0
     property string currentUserPrompt: ""
     property string opencodeBin: Quickshell.env("OPENCODE_BIN") || "opencode"
@@ -678,7 +679,7 @@ ShellRoot {
     function captureScreen() {
         if (screenCapture.running || !root.pendingPrompt) return
         root.logAction("screen", "Captured the screen for context", "monitor chosen by the capture helper")
-        screenCapture.command = [root.appDir + "/bin/screen_capture_secure", root.screenPath]
+        screenCapture.command = [root.appDir + "/bin/screen_capture_secure", root.screenPath, root.screenMonitor]
         screenCapture.running = true
         screenCaptureTimeout.restart()
     }
@@ -1167,6 +1168,31 @@ ShellRoot {
         root.statusText = "Reading the clipboard"
     }
 
+    function startDictation() {
+        if (root.busy || dictation.running) return
+        dictationBuffer = ""
+        dictation.command = ["/usr/bin/python3", root.appDir + "/assistant_dictation.py", "start"]
+        dictation.running = true
+        root.statusText = "Starting dictation"
+    }
+
+    function finishDictation() {
+        var parsed = null
+        try {
+            parsed = JSON.parse(root.dictationBuffer.trim())
+        } catch (error) {
+            parsed = null
+        }
+        root.dictationBuffer = ""
+        if (parsed && parsed.ok === true) {
+            root.statusText = "Dictating — speak now"
+            root.logAction("note", "Started dictation", String(parsed.command || ""))
+        } else {
+            root.statusText = parsed && parsed.error ? String(parsed.error).slice(0, 160) : "Dictation is unavailable"
+            root.logAction("note", "Dictation unavailable", String((parsed && parsed.command) || ""))
+        }
+    }
+
     function finishAttachClipboard() {
         var parsed = null
         try {
@@ -1277,6 +1303,7 @@ ShellRoot {
         if (updateApply.running) updateApply.signal(15)
         if (attachResolve.running) attachResolve.signal(15)
         if (modelListRead.running) modelListRead.signal(15)
+        if (dictation.running) dictation.signal(15)
         if (attachClipboard.running) attachClipboard.signal(15)
         updateRestartDelay.stop()
         if (opencode.running) opencode.signal(15)
@@ -1363,6 +1390,21 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) { root.finishClick(exitCode, "open_application") }
+    }
+
+    Process {
+        id: dictation
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.dictationBuffer += line }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                var value = String(line || "").trim()
+                if (value) root.errorText = value.slice(0, 200)
+            }
+        }
+        onExited: function(exitCode, exitStatus) { root.finishDictation() }
     }
 
     Process {
@@ -2732,6 +2774,29 @@ ShellRoot {
                         }
                         onAccepted: root.send()
                         Keys.onEscapePressed: root.closeAssistant()
+                    }
+
+                    Button {
+                        id: dictateButton
+                        text: "Mic"
+                        enabled: !root.busy && !dictation.running
+                        onClicked: {
+                            root.startDictation()
+                            input.forceActiveFocus()
+                        }
+                        contentItem: Text {
+                            text: dictateButton.text
+                            color: dictateButton.enabled ? "#DCE5F2" : "#657083"
+                            font.family: "Sans Serif"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 12
+                            color: "#273247"
+                            border.color: "#3A465B"
+                        }
                     }
 
                     Button {
