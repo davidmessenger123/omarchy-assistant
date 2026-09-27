@@ -233,10 +233,26 @@ the assistant will not guess a missing one.
 }
 ```
 
-**Recipes cannot run yet.** This release covers describing, reviewing, saving, and
-dry-running them. `command` steps are accepted, saved, and shown, but nothing
-executes until the next stage, and the assistant is told to say so rather than
-improvise the steps itself.
+### Running one
+
+Ask for it by name and give the values, and the card shows every step with the
+values filled in before you approve anything. While it runs:
+
+- **Every step that touches your screen is approved separately.** Nothing from a
+  recipe is ever auto-run, and the status line shows `Recipe <title> 3/6`.
+- **An `ask` step is a hard stop.** The recipe pauses, asks, and does not continue
+  until you reply in the assistant — your reply is read as the answer, not as a
+  new question.
+- **Progress is remembered.** A recipe that is interrupted picks up at the step it
+  reached, and finishing or stopping clears it.
+- **Anything unexpected stops the recipe** and says which step and why, rather
+  than carrying on and hoping.
+
+Steps that run today: `say`, `open`, `type`, `press`, `wait`, `ask`. Steps that are
+accepted in a recipe but **refuse to run** until they are built: `click` (needs the
+assistant to look at the screen to turn a description into coordinates), `wait_for`
+(waiting for text to appear), and `command`. A recipe containing any of those is
+refused up front, by name, rather than running part of the way and stopping.
 
 Two rules are enforced in the format rather than trusted to the draft. Commands run
 as an argument list and never through a shell, so a step containing `;`, `&&`, `|`

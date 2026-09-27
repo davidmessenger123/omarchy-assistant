@@ -47,7 +47,7 @@ export default tool({
     },
     async execute(args) {
         const action = String(args.action || "list").trim().toLowerCase()
-        const allowed = ["list", "show", "dry_run", "save", "delete"]
+        const allowed = ["list", "show", "dry_run", "run", "save", "delete"]
         if (!allowed.includes(action)) return JSON.stringify({ ok: false, error: `Choose one of: ${allowed.join(", ")}.` })
         const name = String(args.name || "").trim().slice(0, 60)
 
@@ -77,6 +77,46 @@ export default tool({
                 recipe: data.recipe || {},
                 lines: data.lines || [],
                 runs_commands: data.runs_commands === true
+            })
+        }
+
+        if (action === "run") {
+            if (!name) return JSON.stringify({ ok: false, error: "Say which recipe to run by name." })
+            const pairs = String(args.values || "")
+                .split(",")
+                .map((pair) => pair.trim())
+                .filter((pair) => pair.includes("="))
+            // The same check the desktop app makes, so the user is never asked to
+            // approve a run that is going to be refused.
+            const preview = await helperCall(["run", name, ...pairs.flatMap((pair) => ["--var", pair])])
+            if (!preview.ok) {
+                return JSON.stringify({
+                    ok: false,
+                    action: "recipes",
+                    op: action,
+                    error: preview.error,
+                    detail: preview.data?.detail,
+                    unsupported: preview.data?.unsupported,
+                    missing: preview.data?.missing || [],
+                    hint: preview.data?.missing?.length
+                        ? "Ask the user for the missing values, then run it again."
+                        : preview.data?.unsupported
+                            ? "Tell the user which step kind is blocking it. Do not offer to work around it by improvising the steps yourself."
+                            : undefined
+                })
+            }
+            const data = preview.data as { lines?: string[]; recipe?: Record<string, unknown> }
+            const lines = data.lines || []
+            return JSON.stringify({
+                ok: true,
+                action: "recipe",
+                operation: "run",
+                recipe_name: name,
+                values: String(args.values || ""),
+                title: String(data.recipe?.title || name),
+                summary: "Run the recipe \"" + String(data.recipe?.title || name) + "\"",
+                lines,
+                note: "Every step that touches the screen is approved separately as the recipe runs, and a step that says STOP AND ASK waits for the user."
             })
         }
 

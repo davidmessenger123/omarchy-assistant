@@ -39,7 +39,14 @@ ShellRoot {
     readonly property var notificationCommands: ({ "dismiss_notifications": ["dismiss"] })
     // Recipes may run commands, so nothing here is ever built from model text
     // beyond the JSON the user is shown and approves.
-    readonly property var recipeOperations: ({ save: "save", delete: "delete" })
+    readonly property var recipeOperations: ({ save: "save", delete: "delete", run: "run" })
+    // Key names a recipe may press. Anything else is refused rather than passed
+    // to wtype, so a recipe cannot turn into arbitrary key injection.
+    readonly property var recipeKeys: ({
+        "return": "Return", "enter": "Return", "tab": "Tab", "escape": "Escape", "esc": "Escape",
+        "backspace": "BackSpace", "delete": "Delete", "space": "space", "up": "Up", "down": "Down",
+        "left": "Left", "right": "Right", "home": "Home", "end": "End", "pageup": "Prior", "pagedown": "Next"
+    })
     property string notificationRunBuffer: ""
     property string windowPlanBuffer: ""
     property string windowRunBuffer: ""
@@ -78,6 +85,16 @@ ShellRoot {
     property bool clipboardHistory: false
     property bool notificationHistory: false
     property string recipeRunBuffer: ""
+    property bool recipeActive: false
+    property string recipeName: ""
+    property string recipeTitle: ""
+    property var recipeSteps: []
+    property int recipeIndex: 0
+    property var recipeVars: ({})
+    property string recipeAwaiting: ""
+    property string recipeLoadBuffer: ""
+    property string appLookupBuffer: ""
+    property string recipePendingStep: ""
     property int maxLooks: 3
     property string screenMonitor: "auto"
     property string settingsBuffer: ""
@@ -343,6 +360,7 @@ ShellRoot {
     function statusLine() {
         var parts = [root.statusText, root.autoMode ? "Auto" : "Manual actions", "Model: " + root.shortModel()]
         if (root.modelPanelVisible) parts.push("model list open")
+        if (root.recipeActive) parts.push("Recipe " + root.recipeTitle + " " + (root.recipeIndex + 1) + "/" + root.recipeSteps.length)
         if (root.autonomyActive) parts.push("Task step " + (root.autonomyStep + 1) + "/" + root.maxAutonomySteps)
         if (root.screenAttached || root.forceScreen) parts.push("Screen context")
         if (root.pendingClick !== null) parts.push("Confirmation")
@@ -859,9 +877,24 @@ ShellRoot {
     // The model cannot see a refusal from here, so the transcript has to say it.
     // Otherwise the user is left with a claim that the change was made.
     function runSelfTest() {
+        // Wrapped so a mistake in a check is reported rather than printing nothing,
+        // which is indistinguishable from the app never having started.
+        try {
+            root.runSelfTestChecks()
+        } catch (error) {
+            console.log("SELFTEST FAIL the checks themselves threw: " + (error && error.message ? error.message : String(error)))
+        }
+        Qt.quit()
+    }
+
+    function runSelfTestChecks() {
         var results = []
-        function expect(name, actual, wanted) {
-            results.push((actual === wanted ? "PASS " : "FAIL ") + name + " (got " + actual + ", wanted " + wanted + ")")
+        function expect(name, actual, wanted, detail) {
+            if (actual === wanted) {
+                results.push("PASS " + name)
+            } else {
+                results.push("FAIL " + name + " (got " + actual + ", wanted " + wanted + (detail ? ", " + detail : "") + ")")
+            }
         }
 
         // Drive the real hand-off: a plan is asked for, the turn ends before the
@@ -927,6 +960,63 @@ ShellRoot {
         root.finishRequest(0)
         expect("a turn after a stalled check is not deferred", root.requestFinished, false)
 
+        // The recipe engine. Every step that touches the screen has to be
+        // approved, a gate has to stop the recipe, and an unknown step has to
+        // stop it rather than be skipped.
+        root.recipeActive = true
+        root.recipeTitle = "selftest"
+        root.recipeSteps = [{ say: "one" }, { say: "two" }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        var messagesBefore = messages.count
+        root.recipeAdvance()
+        expect("both say steps run to the end", root.recipeActive, false)
+        expect("a say step is shown", messages.count >= messagesBefore + 2, true, "messages went from " + messagesBefore + " to " + messages.count)
+        expect("a finished recipe clears its steps", root.recipeSteps.length, 0)
+
+        root.recipeActive = true
+        root.recipeTitle = "gated"
+        root.recipeSteps = [{ say: "before" }, { ask: "your turn" }, { say: "after" }]
+        root.recipeIndex = 1
+        root.recipeAwaiting = ""
+        root.recipeAdvance()
+        expect("an ask gate holds the recipe at that step", root.recipeIndex, 1)
+        expect("an ask gate records the question", root.recipeAwaiting, "your turn")
+        root.recipeFinish("selftest cleanup")
+
+        root.recipeActive = true
+        root.recipeTitle = "keys"
+        root.recipeSteps = [{ press: "Return" }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.proposedAction = null
+        root.pendingClick = null
+        root.recipeAdvance()
+        expect("a known key is proposed for approval", root.proposedAction !== null && root.proposedAction.keysOnly === true, true, JSON.stringify(root.proposedAction))
+        expect("a proposed key press still needs approval", Boolean(root.proposedAction && root.proposedAction.requiresApproval), true)
+        root.proposedAction = null
+        root.recipeFinish("selftest cleanup")
+
+        root.recipeActive = true
+        root.recipeTitle = "badkey"
+        root.recipeSteps = [{ press: "ctrl+alt+delete" }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        var beforeBadKey = messages.count
+        root.recipeAdvance()
+        expect("an unknown key stops the recipe", root.recipeActive, false)
+        expect("an unknown key says why", messages.count > beforeBadKey, true, "messages went from " + beforeBadKey + " to " + messages.count)
+
+        root.recipeActive = true
+        root.recipeTitle = "unsupported"
+        root.recipeSteps = [{ command: ["true"] }]
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.recipeAdvance()
+        expect("a command step stops the recipe", root.recipeActive, false)
+        var lastSaid = messages.count > 0 ? String(messages.get(messages.count - 1).text || "") : ""
+        expect("a command step is not silently skipped", /not runnable yet/.test(lastSaid), true, lastSaid)
+
         // A second change in one turn is refused, and says so out loud.
         var before = messages.count
         root.refuseSecondChange()
@@ -939,7 +1029,6 @@ ShellRoot {
         expect("a turn with no plan in flight does not defer", root.requestFinished, false)
 
         console.log("SELFTEST " + results.join(" | "))
-        Qt.quit()
     }
 
     function refuseSecondChange() {
@@ -1069,11 +1158,234 @@ ShellRoot {
         Qt.callLater(function() { input.forceActiveFocus() })
     }
 
+    function recipeStart(name, valuesText) {
+        if (root.recipeActive) {
+            addMessage("assistant", "\"" + root.recipeTitle + "\" is still running at step " + (root.recipeIndex + 1) + ". Stop it first with: stop recipe.")
+            return
+        }
+        if (windowPlan.running || root.windowPlanPending) return
+        var args = ["run", String(name || "")]
+        var pairs = String(valuesText || "").split(",")
+        for (var i = 0; i < pairs.length; i += 1) {
+            var pair = pairs[i].trim()
+            if (pair.indexOf("=") !== -1) args.push("--var", pair)
+        }
+        root.statusText = "Reading the recipe"
+        root.recipeLoadBuffer = ""
+        root.recipePendingStep = String(name || "")
+        recipeLoad.command = ["/usr/bin/python3", root.appDir + "/assistant_recipes.py"].concat(args)
+        recipeLoad.running = true
+    }
+
+    function finishRecipeLoad() {
+        if (recipeLoad.running) return
+        var result = null
+        try {
+            result = JSON.parse(root.recipeLoadBuffer.trim())
+        } catch (error) {
+            result = null
+        }
+        root.recipeLoadBuffer = ""
+        if (!result || result.ok !== true) {
+            var reason = result && result.error ? String(result.error) : "the recipe could not be read"
+            var detail = result && result.detail ? " " + String(result.detail) : ""
+            var missing = result && result.missing && result.missing.length > 0 ? " It needs: " + result.missing.join(", ") + "." : ""
+            addMessage("assistant", "I did not start \"" + root.recipePendingStep + "\": " + reason + "." + detail + missing)
+            root.statusText = "Nothing started"
+            root.recipePendingStep = ""
+            return
+        }
+        root.recipeActive = true
+        root.recipeName = String(result.name || "")
+        root.recipeTitle = String(result.title || result.name || "")
+        root.recipeSteps = result.steps || []
+        root.recipeIndex = 0
+        root.recipeVars = result.values || ({})
+        root.recipeAwaiting = ""
+        root.logAction("task", "Started the recipe " + root.recipeTitle, String(result.total || 0) + " steps, approved one at a time")
+        addMessage("assistant", "Running \"" + root.recipeTitle + "\", " + (result.total || 0) + " steps. I will ask before each one that touches your screen.")
+        root.recipeSaveProgress()
+        root.recipeAdvance()
+    }
+
+    function recipeAdvance() {
+        if (!root.recipeActive) return
+        if (root.recipeIndex >= root.recipeSteps.length) {
+            root.recipeFinish("finished every step")
+            return
+        }
+        var step = root.recipeSteps[root.recipeIndex]
+        if (!step || typeof step !== "object") {
+            root.recipeIndex += 1
+            root.recipeAdvance()
+            return
+        }
+        var keys = []
+        for (var key in step) {
+            if (key !== "timeout_seconds") keys.push(key)
+        }
+        var action = keys.length > 0 ? keys[0] : ""
+        var value = step[action]
+        var where = "step " + (root.recipeIndex + 1) + " of " + root.recipeSteps.length
+
+        if (action === "say") {
+            addMessage("assistant", String(value))
+            root.recipeStepDone()
+            return
+        }
+        if (action === "wait") {
+            var seconds = Math.max(0, Math.min(Number(value) || 0, 60))
+            root.statusText = root.recipeTitle + ": waiting " + seconds + "s"
+            recipeWait.interval = Math.max(1, seconds * 1000)
+            recipeWait.restart()
+            return
+        }
+        if (action === "ask") {
+            // The gate. Nothing further runs until the user answers.
+            root.recipeAwaiting = String(value)
+            root.statusText = root.recipeTitle + ": waiting for you"
+            addMessage("assistant", String(value) + "\n\nReply here when you are done and I will carry on.")
+            return
+        }
+        if (action === "open") {
+            root.statusText = root.recipeTitle + ": " + where + ", finding " + String(value)
+            root.appLookupBuffer = ""
+            appLookup.command = ["/usr/bin/python3", root.appDir + "/bin/find-application", String(value)]
+            appLookup.running = true
+            return
+        }
+        if (action === "type") {
+            if (!value || typeof value !== "object" || !String(value.text || "").trim()) {
+                root.recipeFail("the type step has no text")
+                return
+            }
+            root.recipePropose({
+                kind: "type",
+                text: String(value.text).slice(0, 20000),
+                target: String(value.target || "the focused field").slice(0, 200),
+                enter: false,
+                fromRecipe: true,
+                recipeStep: where,
+                requiresApproval: true,
+                risk: ""
+            })
+            return
+        }
+        if (action === "press") {
+            var key = root.recipeKeys[String(value || "").trim().toLowerCase()]
+            if (!key) {
+                root.recipeFail("\"" + String(value) + "\" is not a key a recipe may press")
+                return
+            }
+            root.recipePropose({
+                kind: "type",
+                keysOnly: true,
+                text: key,
+                target: "the focused window",
+                enter: false,
+                fromRecipe: true,
+                recipeStep: where,
+                requiresApproval: true,
+                risk: ""
+            })
+            return
+        }
+        root.recipeFail("\"" + action + "\" steps are not runnable yet")
+    }
+
+    function recipePropose(action) {
+        if (root.proposedAction !== null || root.pendingClick !== null) {
+            root.recipeFail("another action was already waiting for approval")
+            return
+        }
+        root.proposedAction = action
+        root.statusText = root.recipeTitle + ": " + action.recipeStep + " needs your approval"
+    }
+
+    function recipeStepDone() {
+        if (!root.recipeActive) return
+        root.recipeIndex += 1
+        root.recipeSaveProgress()
+        root.recipeAdvance()
+    }
+
+    function recipeFail(reason) {
+        var where = "step " + (root.recipeIndex + 1) + " of " + root.recipeSteps.length
+        addMessage("assistant", "Stopped \"" + root.recipeTitle + "\" at " + where + ": " + reason + ". Nothing after that step ran.")
+        root.logAction("task", "A recipe stopped early", root.recipeTitle + " at " + where + ": " + reason)
+        root.recipeFinish("stopped at " + where)
+    }
+
+    function recipeFinish(reason) {
+        var finished = root.recipeTitle
+        root.recipeActive = false
+        root.recipeName = ""
+        root.recipeTitle = ""
+        root.recipeSteps = []
+        root.recipeIndex = 0
+        root.recipeAwaiting = ""
+        root.recipeVars = ({})
+        if (reason === "finished every step") {
+            addMessage("assistant", "\"" + finished + "\" finished. Nothing is left pending.")
+            root.logAction("task", "Recipe finished", finished)
+        }
+        root.statusText = "Ready"
+        recipeProgress.command = ["/usr/bin/python3", root.appDir + "/assistant_recipes.py", "progress", "--clear"]
+        recipeProgress.running = true
+    }
+
+    function recipeSaveProgress() {
+        if (!root.recipeActive) return
+        var payload = { name: root.recipeName, index: root.recipeIndex, vars: root.recipeVars, title: root.recipeTitle }
+        recipeProgress.command = ["/usr/bin/python3", root.appDir + "/assistant_recipes.py", "progress", JSON.stringify(payload)]
+        recipeProgress.running = true
+    }
+
+    function finishAppLookup() {
+        if (appLookup.running) return
+        var found = null
+        try {
+            found = JSON.parse(root.appLookupBuffer.trim())
+        } catch (error) {
+            found = null
+        }
+        root.appLookupBuffer = ""
+        if (!found || found.ok !== true) {
+            root.recipeFail(found && found.error ? String(found.error) : "that application could not be found")
+            return
+        }
+        if (!/^[A-Za-z0-9._-]+$/.test(String(found.id || "")) || String(found.source || "").slice(-8) !== ".desktop") {
+            root.recipeFail("that application entry looked wrong, so I stopped")
+            return
+        }
+        root.recipePropose({
+            kind: "open_application",
+            application: String(found.name || found.id).slice(0, 128),
+            id: String(found.id),
+            source: String(found.source),
+            target: String(found.name || found.id).slice(0, 128),
+            fromRecipe: true,
+            recipeStep: "step " + (root.recipeIndex + 1) + " of " + root.recipeSteps.length,
+            requiresApproval: true,
+            risk: ""
+        })
+    }
+
     function runRecipe(plan) {
         var operation = recipeOperations[String(plan.operation || "")]
         if (!operation) {
             root.clickBusy = false
             addMessage("assistant", "That recipe operation is not one I can run.")
+            return
+        }
+        if (operation === "run") {
+            // Starting a recipe is not itself an action, so it goes through the
+            // engine's own loader rather than the save/delete process.
+            root.activeClick = null
+            root.clickBusy = false
+            root.recipePendingStep = String(plan.recipe_name || "")
+            root.recipeStart(String(plan.recipe_name || ""), String(plan.values || ""))
+            assistant.visible = true
             return
         }
         var command = ["/usr/bin/python3", root.appDir + "/assistant_recipes.py", operation]
@@ -1192,6 +1504,7 @@ ShellRoot {
         root.autonomyFeedback = ""
         root.requestFinished = false
         root.windowPlanPending = false
+        if (root.recipeActive && message && message !== "stopped at " + (root.recipeIndex + 1) + " of " + root.recipeSteps.length) root.recipeFinish(message)
         if (message) root.statusText = message
         if (wasActive) root.logAction("task", "Guarded task finished", message || "completed")
         if (root.screenAttached) {
@@ -1211,9 +1524,13 @@ ShellRoot {
             root.logAction("click", (automatic ? "Clicked " : "Approved click on ") + (action.target || "the screen"), Math.round(action.x * 100) + "% across, " + Math.round(action.y * 100) + "% down")
         } else if (action.kind === "type") {
             // Never store typed text: password managers put secrets on the clipboard.
-            root.logAction("type", "Typed into " + (action.target || "the focused field"), String(action.text || "").length + " characters" + (action.source === "type_text" ? ", long entry" : ""))
+            if (action.keysOnly) {
+                root.logAction("type", "Pressed " + String(action.text || "a key") + " in " + (action.target || "the focused window"), action.fromRecipe ? root.recipeTitle + ", " + action.recipeStep : "")
+            } else {
+                root.logAction("type", "Typed into " + (action.target || "the focused field"), String(action.text || "").length + " characters" + (action.source === "type_text" ? ", long entry" : "") + (action.fromRecipe ? ", " + root.recipeTitle + " " + action.recipeStep : ""))
+            }
         } else if (action.kind === "open_application") {
-            root.logAction("app", "Launched " + (action.application || "an application"), action.target || "")
+            root.logAction("app", "Launched " + (action.application || "an application"), (action.target || "") + (action.fromRecipe ? ", " + root.recipeTitle + " " + action.recipeStep : ""))
         } else if (action.kind === "window") {
             root.logAction("window", String(action.summary || "Changed the windows"), String(action.detail || ""))
         } else if (action.kind === "command") {
@@ -1227,7 +1544,7 @@ ShellRoot {
         if (!root.pendingClick || root.clickBusy) return
         var action = root.pendingClick
         root.pendingClick = null
-        if ((action.kind === "click" || action.kind === "type") && !root.screenAttached) {
+        if ((action.kind === "click" || action.kind === "type") && !action.fromRecipe && !root.screenAttached) {
             root.stopAutonomy("Screen changed; action cancelled")
             return
         }
@@ -1290,8 +1607,12 @@ ShellRoot {
             screenClick.command = ["/usr/bin/python3", root.appDir + "/screen_click.py", "--x", String(request.x), "--y", String(request.y), "--button", request.button, "--monitor-file", root.screenPath + ".monitor"]
             screenClick.running = true
         } else if (request.kind === "type") {
-            var value = String(request.text || "") + (request.enter ? "\n" : "")
-            screenType.command = ["/usr/bin/wtype", "--", value]
+            if (request.keysOnly) {
+                screenType.command = ["/usr/bin/wtype", "-k", String(request.text || "Return")]
+            } else {
+                var value = String(request.text || "") + (request.enter ? "\n" : "")
+                screenType.command = ["/usr/bin/wtype", "--", value]
+            }
             screenType.running = true
         } else if (request.kind === "open_application") {
             screenOpen.command = ["/bin/sh", "-c", "/usr/bin/uwsm-app \"$1\" >/dev/null 2>&1 &", "assistant", request.source]
@@ -1321,6 +1642,11 @@ ShellRoot {
         if (exitCode !== 0) {
             addMessage("assistant", "The action to " + root.actionDescription(request) + " failed.")
             root.stopAutonomy("Action failed")
+            return
+        }
+        if (request.fromRecipe && root.recipeActive) {
+            assistant.visible = true
+            root.recipeStepDone()
             return
         }
         if (root.autonomyActive) {
@@ -1572,6 +1898,17 @@ ShellRoot {
         if (root.busy || root.clickBusy) return
         var prompt = String(input.text || "").trim()
         if (!prompt) return
+        if (root.recipeAwaiting !== "") {
+            // The user is answering a gate, not asking a new question.
+            input.text = ""
+            var gate = root.recipeTitle + " step " + (root.recipeIndex + 1)
+            addMessage("user", prompt)
+            root.logAction("note", "Answered a recipe gate", gate)
+            root.recipeAwaiting = ""
+            root.statusText = root.recipeTitle + ": continuing"
+            root.recipeStepDone()
+            return
+        }
         if (root.attachedImage) {
             root.pendingSendPrompt = prompt
             root.finishSend()
@@ -1679,6 +2016,7 @@ ShellRoot {
         root.autonomyFeedback = ""
         root.requestFinished = false
         root.windowPlanPending = false
+        if (root.recipeActive && message && message !== "stopped at " + (root.recipeIndex + 1) + " of " + root.recipeSteps.length) root.recipeFinish(message)
         root.approvedTargets = []
         root.looksUsed = 0
         input.text = ""
@@ -1873,6 +2211,41 @@ ShellRoot {
             }
         }
         onExited: function(exitCode, exitStatus) {}
+    }
+
+    Timer {
+        id: recipeWait
+        interval: 1000
+        repeat: false
+        onTriggered: root.recipeStepDone()
+    }
+
+    Process {
+        id: recipeLoad
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.recipeLoadBuffer += line + "\n" }
+        }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) { root.finishRecipeLoad() }
+    }
+
+    Process {
+        id: recipeProgress
+        command: []
+        stdout: SplitParser { onRead: function(line) {} }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) {}
+    }
+
+    Process {
+        id: appLookup
+        command: []
+        stdout: SplitParser {
+            onRead: function(line) { root.appLookupBuffer += line + "\n" }
+        }
+        stderr: SplitParser { onRead: function(line) {} }
+        onExited: function(exitCode, exitStatus) { root.finishAppLookup() }
     }
 
     Process {

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Resolve an application name to a desktop entry, for the desktop app.
+
+The OpenCode tool and this script answer the same question the same way: search the
+standard application directories, match on visible name or desktop id, and hand back
+the .desktop path. The desktop app runs this before proposing an `open` step from a
+recipe, so the same application is found whichever way it was asked for.
+
+Usage:
+  find-application Teams
+  find-application --list
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+MAX_ENTRIES = 400
+# Deliberately conservative: a .desktop path is passed to a launcher, so it has to
+# look like one and live in a directory we searched ourselves.
+DESKTOP_NAME = re.compile(r"^[A-Za-z0-9._@+-]+\.desktop$")
+
+
+def roots() -> list[Path]:
+    candidates = [
+        os.environ.get("XDG_DATA_HOME") or "",
+        str(Path.home() / ".local" / "share"),
+        "/usr/local/share",
+        "/usr/share",
+    ]
+    found: list[Path] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate) / "applications"
+        if path not in found:
+            found.append(path)
+    return found
+
+
+def unescape(value: str) -> str:
+    return value.replace("\\s", " ").replace("\\n", " ").replace("\\t", " ").replace("\\\\", "\\").strip()
+
+
+def parse(text: str, identifier: str, source: str) -> dict | None:
+    name = ""
+    generic = ""
+    keywords: list[str] = []
+    hidden = False
+    no_display = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key == "Name":
+            if not name:
+                name = unescape(value)
+        elif key == "GenericName":
+            generic = unescape(value)
+        elif key == "Keywords":
+            keywords = [part.strip() for part in unescape(value).split(",") if part.strip()]
+        elif key == "NoDisplay":
+            no_display = unescape(value).lower() == "true"
+        elif key in ("Hidden", "TryExec"):
+            if unescape(value).lower() == "true":
+                hidden = True
+    if not name or hidden or no_display:
+        return None
+    if not DESKTOP_NAME.match(source.rsplit("/", 1)[-1]):
+        return None
+    return {
+        "id": identifier,
+        "name": name,
+        "generic": generic,
+        "keywords": keywords,
+        "search": " ".join([name, generic, *keywords, identifier]).lower(),
+        "source": source
+    }
+
+
+def installed() -> list[dict]:
+    found: dict[str, dict] = {}
+    for root in roots():
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_file() or not entry.name.endswith(".desktop"):
+                continue
+            identifier = entry.name[: -len(".desktop")]
+            if identifier in found:
+                continue
+            try:
+                parsed = parse(entry.read_text(errors="replace"), identifier, str(entry))
+            except OSError:
+                continue
+            if parsed:
+                found[identifier] = parsed
+            if len(found) >= MAX_ENTRIES:
+                break
+    return sorted(found.values(), key=lambda item: item["name"].lower())
+
+
+def normalise(value: str) -> str:
+    return "".join(character for character in value.lower() if character.isalnum() or character.isspace()).strip()
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--list":
+        apps = installed()
+        print(json.dumps({"ok": True, "count": len(apps), "applications": [{"id": a["id"], "name": a["name"]} for a in apps]}, separators=(",", ":")))
+        return 0
+
+    query = normalise(" ".join(sys.argv[1:]))
+    if not query:
+        print(json.dumps({"ok": False, "error": "no application name given"}, separators=(",", ":")))
+        return 1
+
+    apps = installed()
+    exact = [a for a in apps if normalise(a["id"]) == query or normalise(a["name"]) == query]
+    if len(exact) == 1:
+        print(json.dumps({"ok": True, **exact[0]}, separators=(",", ":")))
+        return 0
+    partial = [a for a in apps if query in normalise(a["search"])]
+    if len(partial) == 1:
+        print(json.dumps({"ok": True, **partial[0]}, separators=(",", ":")))
+        return 0
+    if not partial:
+        print(json.dumps({"ok": False, "error": f"no installed application matches '{' '.join(sys.argv[1:])}'"}, separators=(",", ":")))
+        return 1
+    names = sorted({a["name"] for a in partial})
+    print(json.dumps({
+        "ok": False,
+        "error": f"'{query}' matches {len(partial)} applications",
+        "candidates": [{"id": a["id"], "name": a["name"]} for a in partial[:8]]
+    }, separators=(",", ":")))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

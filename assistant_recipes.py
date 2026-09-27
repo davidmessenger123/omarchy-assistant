@@ -33,6 +33,10 @@ Usage:
   assistant_recipes.py list
   assistant_recipes.py show NAME
   assistant_recipes.py dry-run NAME [--var key=value]...
+  assistant_recipes.py run NAME [--var key=value]...    resolved steps, or why not
+  assistant_recipes.py progress                          where a paused recipe got to
+  assistant_recipes.py progress '<json>'                 record progress
+  assistant_recipes.py progress --clear                  forget progress
   assistant_recipes.py validate '<json>'
   assistant_recipes.py save '<json>'
   assistant_recipes.py delete NAME
@@ -183,6 +187,76 @@ def fill(text: str, values: dict[str, str]) -> str:
     return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
 
 
+def progress_path() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "omarchy-assistant" / "recipe-progress.json"
+
+
+def read_progress() -> dict | None:
+    try:
+        stored = json.loads(progress_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return stored if isinstance(stored, dict) else None
+
+
+def write_progress(payload: dict) -> None:
+    path = progress_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload))
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+    os.chmod(path, 0o600)
+
+
+def fill(text: str, values: dict[str, str]) -> str:
+    return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
+
+
+def resolve_steps(recipe: dict, values: dict[str, str]) -> list[dict]:
+    """The steps with placeholders filled in, ready to hand to the desktop app."""
+    resolved: list[dict] = []
+    for step in recipe.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        action = next((key for key in step if key != "timeout_seconds"), "")
+        value = step.get(action)
+        if isinstance(value, str):
+            value = fill(value, values)
+        elif isinstance(value, dict):
+            value = {key: fill(str(item), values) if isinstance(item, str) else item for key, item in value.items()}
+        elif isinstance(value, list) and action == "command":
+            value = [fill(str(item), values) for item in value]
+        entry: dict[str, Any] = {action: value}
+        if "timeout_seconds" in step:
+            entry["timeout_seconds"] = step["timeout_seconds"]
+        resolved.append(entry)
+    return resolved
+
+
+# Steps the desktop app knows how to carry out. Anything else is refused outright
+# rather than skipped, so a recipe never quietly does less than it says.
+SUPPORTED = {"say", "open", "click", "type", "press", "wait", "ask"}
+# Accepted when a recipe is written, but not runnable yet.
+PENDING = {
+    "command": "commands are not runnable yet",
+    "wait_for": "waiting for text on screen is not implemented yet",
+    "click": "clicking a described target needs the assistant to look at the screen for it, which is not wired up yet"
+}
+
+
+def unsupported(recipe: dict) -> dict[str, int]:
+    found: dict[str, int] = {}
+    for step in recipe.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        action = next((key for key in step if key != "timeout_seconds"), "")
+        if action in PENDING:
+            found[action] = found.get(action, 0) + 1
+    return found
+
+
 def load_all() -> list[dict]:
     directory = recipe_dir()
     if not directory.is_dir():
@@ -264,13 +338,68 @@ def parse_vars(pairs: list[str]) -> tuple[dict[str, str], list[str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recipes for the Omarchy Assistant.")
-    parser.add_argument("command", choices=["list", "show", "dry-run", "validate", "save", "delete"])
+    parser.add_argument("command", choices=["list", "show", "dry-run", "run", "progress", "validate", "save", "delete"])
     parser.add_argument("payload", nargs="?", default="")
     parser.add_argument("--var", dest="vars", action="append", default=[])
+    parser.add_argument("--clear", dest="clear", action="store_true")
     args = parser.parse_args()
 
     if args.command == "list":
         return emit({"ok": True, "count": len(recipes := load_all()), "recipes": [summarise(r) for r in recipes]})
+
+    if args.command == "progress":
+        if args.clear:
+            path = progress_path()
+            had = path.is_file()
+            if had:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            return emit({"ok": True, "cleared": had})
+        if args.payload:
+            try:
+                payload = json.loads(args.payload)
+            except json.JSONDecodeError as error:
+                return fail(f"the progress could not be read: {error}")
+            if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
+                return fail("progress needs at least a recipe name")
+            payload["updated"] = int(time.time())
+            write_progress(payload)
+            return emit({"ok": True, "progress": payload})
+        path = progress_path()
+        had = path.is_file()
+        if args.payload == "--clear" and had:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return emit({"ok": True, "cleared": True})
+        return emit({"ok": True, "progress": None if not had else read_progress()})
+
+    if args.command == "run":
+        name = args.payload or ""
+        if not NAME_PATTERN.match(name):
+            return fail("that is not a recipe name")
+        recipe = read(name)
+        if recipe is None:
+            return fail("there is no recipe with that name")
+        blocked = unsupported(recipe)
+        if blocked:
+            return emit({
+                "ok": False,
+                "error": "this recipe cannot run yet",
+                "unsupported": blocked,
+                "detail": "; ".join(f"{count} {kind} step" + ("s" if count != 1 else "") + f": {PENDING[kind]}" for kind, count in sorted(blocked.items()))
+            })
+        values, bad = parse_vars(args.vars)
+        if bad:
+            return fail("; ".join(bad))
+        missing = sorted(set(recipe.get("vars") or []) - set(values))
+        if missing:
+            return emit({"ok": False, "error": "this recipe needs values before it can run", "missing": missing, "vars": recipe.get("vars") or []})
+        steps = resolve_steps(recipe, values)
+        return emit({"ok": True, "name": name, "title": str(recipe.get("title") or name), "steps": steps, "total": len(steps), "lines": render(recipe, values), "summary": summarise(recipe), "values": values})
 
     if args.command == "delete":
         if not NAME_PATTERN.match(args.payload or ""):
@@ -313,7 +442,7 @@ def main() -> int:
     missing = sorted(set(recipe.get("vars") or []) - set(values))
     if missing:
         return emit({"ok": False, "error": "this recipe needs values before it can be shown with them filled in", "missing": missing, "vars": recipe.get("vars") or []})
-    return emit({"ok": True, "recipe": summarise(recipe), "values": values, "lines": render(recipe, values), "runs_commands": any(next((k for k in s if k != "timeout_seconds"), "") == "command" for s in recipe.get("steps") or [])})
+    return emit({"ok": True, "recipe": summarise(recipe), "values": values, "lines": render(recipe, values), "steps": resolve_steps(recipe, values), "total": len(recipe.get("steps") or []), "runs_commands": any(next((k for k in s if k != "timeout_seconds"), "") == "command" for s in recipe.get("steps") or [])})
 
 
 if __name__ == "__main__":
