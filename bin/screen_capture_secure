@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+output="${1:?output path required}"
+mapfile -t active_monitors < <(/usr/bin/hyprctl monitors -j | /usr/bin/python3 -c 'import json,sys; data=json.load(sys.stdin); print("\n".join(item.get("name", "") for item in data if item.get("name") and not item.get("disabled")))')
+focused_monitor="$(/usr/bin/hyprctl monitors -j | /usr/bin/python3 -c 'import json,sys; data=json.load(sys.stdin); print(next((item.get("name", "") for item in data if item.get("focused") and not item.get("disabled")), ""))')"
+if [[ -z "$focused_monitor" && ${#active_monitors[@]} -gt 0 ]]; then
+    focused_monitor="${active_monitors[0]}"
+fi
+restore_outputs() {
+    for name in "${disabled_outputs[@]}"; do
+        /usr/bin/hyprctl output "$name" enable >/dev/null 2>&1 || true
+    done
+}
+disabled_outputs=()
+if [[ ${#active_monitors[@]} -gt 1 && -n "$focused_monitor" ]]; then
+    trap restore_outputs EXIT INT TERM
+    for name in "${active_monitors[@]}"; do
+        if [[ "$name" != "$focused_monitor" ]]; then
+            /usr/bin/hyprctl output "$name" disable >/dev/null 2>&1 || true
+            disabled_outputs+=("$name")
+        fi
+    done
+    sleep 0.4
+    "$script_dir/screen_capture" -o "$focused_monitor" "$output"
+else
+    "$script_dir/screen_capture" "$output"
+fi
+printf '%s\n' "$focused_monitor" > "$output.monitor"
+chmod 600 "$output" "$output.monitor"

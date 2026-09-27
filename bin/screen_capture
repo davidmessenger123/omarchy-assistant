@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+case "$(uname -m)" in
+    x86_64|amd64)
+        exec "$script_dir/screen_capture-x86_64" "$@"
+        ;;
+    *)
+        exec /usr/bin/grim "$@"
+        ;;
+esac
