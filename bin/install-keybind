@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Add or refresh the Hyprland keybinding that launches the Omarchy Assistant.
+#
+# The binding is written into a clearly delimited block so re-running is safe:
+#   - no binding for the combo        -> append a managed block
+#   - our block with a stale path     -> rewrite the path in place
+#   - a foreign binding for the combo -> leave it alone unless --force is given
+#
+# A timestamped backup is written before any change, and the new config is
+# validated with `hyprctl reload` plus `hyprctl configerrors`; if validation
+# fails the backup is restored.
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+app_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+
+combo="${ASSISTANT_KEYBIND:-SUPER + SHIFT + Q}"
+description="Omarchy Assistant"
+marker_begin="-- >>> omarchy-assistant >>>"
+marker_end="-- <<< omarchy-assistant <<<"
+force=0
+dry_run=0
+reload=1
+
+usage() {
+    cat <<'EOF'
+Usage: install-keybind [options]
+
+  --combo "SUPER + SHIFT + Q"  Key combination to bind (default: SUPER + SHIFT + Q)
+  --force                      Replace a different binding that uses the same combo
+  --dry-run                    Print what would change without writing anything
+  --no-reload                  Do not run hyprctl reload after writing
+  -h, --help                   Show this help
+EOF
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --combo)
+            shift
+            combo="${1:-}"
+            [[ -n "$combo" ]] || { printf -- '--combo needs a value.\n' >&2; exit 1; }
+            ;;
+        --force)
+            force=1
+            ;;
+        --dry-run)
+            dry_run=1
+            ;;
+        --no-reload)
+            reload=0
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+bindings="$config_dir/bindings.lua"
+launch_path="$app_dir/run.sh"
+
+if ! command -v hyprctl >/dev/null 2>&1; then
+    printf 'Skipping the keybinding: hyprctl was not found, so this does not look like Hyprland.\n' >&2
+    printf 'Add this to %s manually:\n' "$bindings" >&2
+    printf '  o.bind("%s", "%s", { launch = "%s" })\n' "$combo" "$description" "$launch_path" >&2
+    exit 0
+fi
+if [[ ! -e "$bindings" ]]; then
+    printf 'Skipping the keybinding: %s does not exist.\n' "$bindings" >&2
+    printf 'Add this to it manually:\n' >&2
+    printf '  o.bind("%s", "%s", { launch = "%s" })\n' "$combo" "$description" "$launch_path" >&2
+    exit 0
+fi
+if [[ -L "$bindings" ]]; then
+    printf 'Skipping the keybinding: %s is a symlink to %s.\n' "$bindings" "$(readlink -f "$bindings")" >&2
+    printf 'Edit that file yourself to add:\n' >&2
+    printf '  o.bind("%s", "%s", { launch = "%s" })\n' "$combo" "$description" "$launch_path" >&2
+    exit 0
+fi
+if [[ ! -w "$bindings" ]]; then
+    printf 'Skipping the keybinding: %s is not writable.\n' "$bindings" >&2
+    exit 0
+fi
+
+# Escape a path for use inside a Lua double-quoted string.
+lua_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "$value"
+}
+
+launch_escaped="$(lua_escape "$launch_path")"
+bind_call="bind"
+if ((force)); then
+    bind_call="rebind"
+fi
+
+managed_block() {
+    printf '%s\n' "$marker_begin"
+    printf 'o.%s("%s", "%s", {\n' "$bind_call" "$combo" "$description"
+    printf '  launch = "%s"\n' "$launch_escaped"
+    printf '})\n'
+    printf '%s\n' "$marker_end"
+}
+
+has_managed_block() {
+    grep -qF -- "$marker_begin" "$bindings"
+}
+
+# The description of a foreign binding on the same combo, for the report.
+describe_conflict() {
+    # Uses plain string matching rather than a regex, because a key combo such as
+    # "SUPER + SHIFT + Q" contains characters that are regex metacharacters.
+    local candidate number rest description=""
+    while IFS= read -r candidate; do
+        [[ -z "$candidate" ]] && continue
+        if [[ "$candidate" == *"o.bind(\"$combo\""* || "$candidate" == *"o.rebind(\"$combo\""* ]]; then
+            number="${candidate%%:*}"
+            rest="${candidate#*:}"
+            rest="${rest#*\"$combo\"}"
+            rest="${rest#,}"
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+            if [[ "$rest" == \"* ]]; then
+                rest="${rest#\"}"
+                description="${rest%%\"*}"
+            fi
+            printf 'line %s: %s' "$number" "${description:-an unnamed action}"
+            return 0
+        fi
+    done < <(grep -n -e 'o\.bind(' -e 'o\.rebind(' -- "$bindings" 2>/dev/null || true)
+    return 1
+}
+
+strip_managed_block() {
+    awk -v begin="$marker_begin" -v end="$marker_end" '
+        $0 == begin { skipping = 1; next }
+        $0 == end   { skipping = 0; next }
+        !skipping   { print }
+    ' "$bindings"
+}
+
+foreign_conflict=""
+if ! foreign_conflict="$(describe_conflict)"; then
+    foreign_conflict=""
+fi
+
+if has_managed_block; then
+    if grep -qF "launch = \"$launch_escaped\"" "$bindings" && ((force == 0)); then
+        printf 'Keybinding already up to date: %s launches %s\n' "$combo" "$launch_path"
+        exit 0
+    fi
+    action="updated"
+elif [[ -n "$foreign_conflict" ]] && ((force == 0)); then
+    printf 'Skipping the keybinding: %s is already bound (%s).\n' "$combo" "$foreign_conflict"
+    printf 'Re-run with --force to replace it, or edit %s yourself.\n' "$bindings"
+    exit 0
+elif [[ -n "$foreign_conflict" ]]; then
+    action="replaced"
+else
+    action="added"
+fi
+
+if ((dry_run)); then
+    printf 'Would %s the keybinding in %s:\n' "$action" "$bindings"
+    managed_block
+    exit 0
+fi
+
+backup="$bindings.bak.$(date +%s)"
+cp -p "$bindings" "$backup"
+
+temp_file="$(mktemp "$config_dir/.bindings.lua.XXXXXX")"
+cleanup() { rm -f "$temp_file"; }
+trap cleanup EXIT
+
+if has_managed_block; then
+    strip_managed_block >"$temp_file"
+else
+    cat "$bindings" >"$temp_file"
+fi
+# Keep exactly one blank line between the previous content and the block.
+if [[ -s "$temp_file" ]] && [[ "$(tail -c 1 "$temp_file" | wc -l)" -eq 0 ]]; then
+    printf '\n' >>"$temp_file"
+fi
+printf '\n' >>"$temp_file"
+managed_block >>"$temp_file"
+chmod --reference="$bindings" "$temp_file" 2>/dev/null || chmod 644 "$temp_file"
+mv "$temp_file" "$bindings"
+
+if ((reload)); then
+    if hyprctl reload >/dev/null 2>&1; then
+        errors="$(hyprctl configerrors 2>/dev/null || true)"
+        if [[ -n "${errors//[[:space:]]/}" ]]; then
+            printf 'Hyprland reported config errors, so the keybinding was rolled back.\n' >&2
+            printf '%s\n' "$errors" >&2
+            mv "$backup" "$bindings"
+            hyprctl reload >/dev/null 2>&1 || true
+            printf 'Restored %s from %s\n' "$bindings" "$backup" >&2
+            exit 1
+        fi
+    else
+        printf 'Warning: hyprctl reload failed; the binding is saved but not active yet.\n' >&2
+    fi
+fi
+
+case "$action" in
+    added) printf 'Added %s to launch the Omarchy Assistant from %s\n' "$combo" "$launch_path" ;;
+    updated) printf 'Updated the assistant keybinding to launch %s\n' "$launch_path" ;;
+    replaced) printf 'Replaced the binding for %s (was %s) with the assistant launcher\n' "$combo" "$foreign_conflict" ;;
+esac
+printf 'Backup: %s\n' "$backup"

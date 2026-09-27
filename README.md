@@ -29,7 +29,7 @@ cd omarchy-assistant
 ./install.sh
 ```
 
-`install.sh` installs the project-local OpenCode tool dependency and prints the exact Hyprland binding to add. It does not modify Hyprland configuration automatically.
+`install.sh` installs the project-local OpenCode tool dependency and adds the Hyprland keybinding for you. Image models are never downloaded automatically.
 
 To install the local image model in the same step (about 13 GB, so it is opt-in and never happens by accident):
 
@@ -39,15 +39,30 @@ To install the local image model in the same step (about 13 GB, so it is opt-in 
 
 `install.sh --help` lists the options, including `--image-model-args "--rocm 6.4"` to pin a ROCm index and `--yes` to skip the confirmation prompt.
 
-Add this to `~/.config/hypr/bindings.lua`, using the clone path printed by the installer:
+### Keybinding
+
+By default `install.sh` binds `SUPER + SHIFT + Q` to launch the assistant, writing a clearly marked block into `~/.config/hypr/bindings.lua`:
 
 ```lua
+-- >>> omarchy-assistant >>>
 o.bind("SUPER + SHIFT + Q", "Omarchy Assistant", {
   launch = "/path/to/omarchy-assistant/run.sh"
 })
+-- <<< omarchy-assistant <<<
 ```
 
-Reload Hyprland, then launch with `run.sh` or the binding.
+The installer is careful about your configuration:
+
+- A timestamped backup is written to `bindings.lua.bak.<epoch>` before any change, and the file is replaced atomically.
+- Re-running is safe. If the block already points at the right path it does nothing; if the repository moved, it updates the path in place.
+- If something else is already bound to that combination, nothing is overwritten. The installer prints what the key was bound to and tells you to re-run with `--force-keybind`, which uses `o.rebind` and reports what it replaced.
+- After writing, the config is validated with `hyprctl reload` and `hyprctl configerrors`. If Hyprland reports errors, the backup is restored automatically.
+- Symlinked or read-only `bindings.lua` files, missing files, and non-Hyprland systems are skipped with the manual line to add.
+- The launch path is only refreshed by re-running the installer; the **Update** button never edits your Hyprland config.
+
+Options: `--keybind-combo "SUPER + ALT + G"`, `--force-keybind`, and `--no-keybind` to skip and print the line instead.
+
+The installer reloads Hyprland for you, so the shortcut works right away. Launch with `run.sh` or the binding.
 
 For synthetic clicking, ensure the user can access `/dev/uinput` using the system's udev/ACL policy. The assistant refuses to silently fall back to unrestricted input.
 

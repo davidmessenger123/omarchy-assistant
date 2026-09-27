@@ -10,18 +10,28 @@ Usage: install.sh [options]
   --with-image-model     Also install the local image backend (about 13 GB:
                          PyTorch, diffusers, and the SDXL-Turbo weights)
   --image-model-args "…" Pass extra options to bin/assistant-config setup-image-models
+  --keybind-combo "…"    Hyprland shortcut to bind (default: SUPER + SHIFT + Q)
+  --force-keybind        Replace a different binding that uses the same combo
+  --no-keybind           Do not touch the Hyprland config; print the line instead
   --yes                  Do not ask for confirmation before the model download
   -h, --help             Show this help
 
 Without options, install.sh only installs the OpenCode tool dependencies, which
 is fast. Image models are never downloaded automatically, and the in-app Update
 button never downloads them either.
+
+The Hyprland keybinding is added to ~/.config/hypr/bindings.lua inside a marked
+block, with a timestamped backup, and only when nothing else already uses that
+combination. Pass --no-keybind to skip it.
 EOF
 }
 
 with_image_model=0
 assume_yes=0
 image_model_args=""
+add_keybind=1
+force_keybind=0
+keybind_combo="SUPER + SHIFT + Q"
 while (($# > 0)); do
     case "$1" in
         --with-image-model)
@@ -34,6 +44,20 @@ while (($# > 0)); do
                 printf -- '--image-model-args needs a value.\n' >&2
                 exit 1
             fi
+            ;;
+        --keybind-combo)
+            shift
+            keybind_combo="${1:-}"
+            if [[ -z "$keybind_combo" ]]; then
+                printf -- '--keybind-combo needs a value.\n' >&2
+                exit 1
+            fi
+            ;;
+        --force-keybind)
+            force_keybind=1
+            ;;
+        --no-keybind)
+            add_keybind=0
             ;;
         --yes | -y)
             assume_yes=1
@@ -71,7 +95,7 @@ if ! python3 -c 'import venv' >/dev/null 2>&1; then
     printf 'Warning: python3 cannot create virtual environments.\n' >&2
     printf 'Install the venv module (Arch: pacman -S python; Debian/Ubuntu: python3-venv) before setting up the image model.\n' >&2
 fi
-chmod +x "$script_dir/run.sh" "$script_dir/screen_click.py" "$script_dir/assistant_memory.py" "$script_dir/assistant_update.py" "$script_dir/assistant_image_local.py" "$script_dir/bin/assistant-config" "$script_dir/bin/screen_capture" "$script_dir/bin/screen_capture_secure"
+chmod +x "$script_dir/run.sh" "$script_dir/screen_click.py" "$script_dir/assistant_memory.py" "$script_dir/assistant_update.py" "$script_dir/assistant_image_local.py" "$script_dir/bin/assistant-config" "$script_dir/bin/install-keybind" "$script_dir/bin/screen_capture" "$script_dir/bin/screen_capture_secure"
 npm install --prefix "$script_dir/.opencode"
 printf 'Installed OpenCode tool dependencies.\n'
 
@@ -104,9 +128,22 @@ if ((with_image_model)); then
     fi
 fi
 
+printf '\nHyprland keybinding\n'
+if ((add_keybind)); then
+    keybind_args=(--combo "$keybind_combo")
+    if ((force_keybind)); then
+        keybind_args+=(--force)
+    fi
+    if ! "$script_dir/bin/install-keybind" "${keybind_args[@]}"; then
+        printf 'The keybinding could not be installed automatically; add it by hand:\n' >&2
+        printf '  o.bind("%s", "Omarchy Assistant", { launch = "%s/run.sh" })\n' "$keybind_combo" "$script_dir" >&2
+    fi
+else
+    printf 'Skipped. Add this to ~/.config/hypr/bindings.lua:\n'
+    printf '  o.bind("%s", "Omarchy Assistant", { launch = "%s/run.sh" })\n' "$keybind_combo" "$script_dir"
+fi
+
 printf 'Launch with: %s/run.sh\n' "$script_dir"
-printf 'Add this Hyprland binding to ~/.config/hypr/bindings.lua:\n'
-printf '  o.bind("SUPER + SHIFT + Q", "Omarchy Assistant", { launch = "%s/run.sh" })\n' "$script_dir"
 if [[ ! -e /dev/uinput ]]; then
     printf 'Warning: /dev/uinput is unavailable; autonomous clicking will not work until access is granted.\n' >&2
 fi
