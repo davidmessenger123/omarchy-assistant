@@ -13,6 +13,8 @@ Usage:
   assistant_clipboard_history.py list      recent entries, newest first
   assistant_clipboard_history.py get N     one entry by number
   assistant_clipboard_history.py clear     forget everything
+
+`record` is internal: wl-paste --watch invokes it with the new selection on stdin.
 """
 
 from __future__ import annotations
@@ -114,6 +116,12 @@ def record() -> None:
     text = current_text()
     if not text.strip():
         return
+    store_text(text)
+
+
+def store_text(text: str) -> None:
+    if not text.strip():
+        return
     truncated = len(text) > MAX_CHARS
     text = text[:MAX_CHARS]
     entries = prune(load())
@@ -123,18 +131,33 @@ def record() -> None:
     save(prune(entries))
 
 
+def record_stdin() -> int:
+    """Store one selection delivered by wl-paste --watch."""
+    raw = sys.stdin.buffer.read(MAX_CHARS * 4 + 1)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return 0
+    store_text(text)
+    return 0
+
+
 def watch() -> int:
     """Record every clipboard change until the process is stopped."""
     pid_path().write_text(str(os.getpid()))
     os.chmod(pid_path(), 0o600)
+    command = [
+        WL_PASTE, "--watch",
+        sys.executable, str(Path(__file__).resolve()), "record",
+    ]
     try:
         while True:
-            # Discard the payload: it is re-read deliberately, so images and huge
-            # selections never pass through this process.
-            watcher = subprocess.Popen([WL_PASTE, "--watch"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # wl-paste runs the command once per selection change, with the
+            # payload on stdin. It stays alive between changes; if it exits we
+            # retry rather than falling back to polling the clipboard.
+            watcher = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             watcher.wait()
             time.sleep(WATCH_INTERVAL)
-            record()
     except KeyboardInterrupt:
         return 0
     finally:
@@ -159,7 +182,7 @@ def describe(entry: dict, number: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bounded clipboard history for the assistant.")
-    parser.add_argument("command", choices=["start", "stop", "status", "list", "get", "clear"])
+    parser.add_argument("command", choices=["start", "stop", "status", "list", "get", "clear", "record"])
     parser.add_argument("number", nargs="?", type=int, default=0)
     parser.add_argument("--query", default="")
     parser.add_argument("--limit", type=int, default=20)
@@ -209,6 +232,9 @@ def main() -> int:
         save([])
         print(json.dumps({"ok": True, "cleared": True}))
         return 0
+
+    if args.command == "record":
+        return record_stdin()
 
     entries = prune(load())
     save(entries)
