@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -144,12 +145,20 @@ def record_stdin() -> int:
 
 def watch() -> int:
     """Record every clipboard change until the process is stopped."""
+    state_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
     pid_path().write_text(str(os.getpid()))
     os.chmod(pid_path(), 0o600)
     command = [
         WL_PASTE, "--watch",
         sys.executable, str(Path(__file__).resolve()), "record",
     ]
+    watcher = None
+
+    def stop(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     try:
         while True:
             # wl-paste runs the command once per selection change, with the
@@ -157,10 +166,14 @@ def watch() -> int:
             # retry rather than falling back to polling the clipboard.
             watcher = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             watcher.wait()
+            watcher = None
             time.sleep(WATCH_INTERVAL)
-    except KeyboardInterrupt:
-        return 0
     finally:
+        if watcher is not None:
+            try:
+                watcher.terminate()
+            except OSError:
+                pass
         try:
             if pid_path().read_text().strip() == str(os.getpid()):
                 pid_path().unlink()
